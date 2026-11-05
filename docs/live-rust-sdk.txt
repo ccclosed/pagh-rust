@@ -1,0 +1,269 @@
+pagh-rust — live Rust SDK verification
+=========================================
+date (UTC):        2026-11-05T08:07:24+00:00
+repo:              /home/oleg/pagh-rust
+repo state:        68d9ac4
+toolchain:         nightly-2026-07-12 (rustc 1.99.0-nightly (be8e82435 2026-07-11))
+target:            riscv64gc-unknown-none-elf
+kernel:            /home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh (sha256 bd97f7ad691c2e05a67859136f29434c0f31fd0c209903535352156eaa5d63bc)
+kernel package:    pagh-riscv 0.11.0 (Cargo.toml)
+qemu:              QEMU emulator version 10.2.2 (qemu-10.2.2-1.fc44)
+image:             64 MiB ext2, mke2fs -q -t ext2 -F -b 4096 -d <rootfs> disk.img 64M
+build:             ./build.sh --fixtures (debug profile, opt-level 2, strip debuginfo)
+checks:            62/62 checks passed
+
+The transcript below has CRLF/CR normalized to LF. The shell prompt is
+`pagh:rv64>`. A `run: <path> exited with code N` line is the kernel's own
+result line, not something pagh_std prints.
+
+===== serial transcript =====
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 1
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 317 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 61 KB
+Firmware Heap Offset        : 0x46000
+Firmware Heap Size          : 37 KB (total), 2 KB (reserved), 11 KB (used), 23 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008004ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x000000008fe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 0
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+framebuffer  ramfb 1280x800 stride 5120 cells 100x37
+
+========================================
+   pagh OS — RISC-V (RV64)
+========================================
+boot hart   0
+device tree 0x8fe00000
+memory      0x80000000..0x90000000 (256 MiB)
+timebase    10000000 Hz
+console     NS16550 @ 0x10000000
+pmm         62673/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080b2d, identity 0x80000000..0x90000000 (RWX below 0x80b2d000, RW above), 65548 pages, 12 device
+timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
+plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
+task        8 slots, 16 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
+virtio-blk: virtio-blk0 at 0x10008000: 131072 sectors (64 MiB)
+virtio-input: no device
+fs          virtio-blk0 (131072 sectors, 65536 KiB)
+fs          ext2 on /mnt, 4096 B blocks, 14958/16384 blocks free, 16355/16384 inodes free
+virtio-net: no device
+net         no network device
+
+Type 'help' for the command list.
+
+pagh:rv64> run /mnt/cat /mnt/hello.txt
+hello from pagh-rust
+second line
+run: /mnt/cat exited with code 0
+pagh:rv64> run /mnt/cat /mnt/hello.txt /mnt/lines.txt
+hello from pagh-rust
+second line
+one two three
+four five
+six
+
+last line without newlinerun: /mnt/cat exited with code 0
+pagh:rv64> run /mnt/cat /mnt/missing.txt
+cat: /mnt/missing.txt: No such file or directory
+run: /mnt/cat exited with code 1
+pagh:rv64> run /mnt/wc /mnt/hello.txt
+      2       5      33 /mnt/hello.txt
+run: /mnt/wc exited with code 0
+pagh:rv64> run /mnt/wc -l /mnt/large.txt
+    200 /mnt/large.txt
+run: /mnt/wc exited with code 0
+pagh:rv64> run /mnt/wc /mnt/hello.txt /mnt/demo/alpha.txt
+      2       5      33 /mnt/hello.txt
+      1       1       6 /mnt/demo/alpha.txt
+      3       6      39 total
+run: /mnt/wc exited with code 0
+pagh:rv64> run /mnt/wc -c /mnt/empty.txt
+      0 /mnt/empty.txt
+run: /mnt/wc exited with code 0
+pagh:rv64> run /mnt/find /mnt/demo
+/mnt/demo
+/mnt/demo/alpha.txt
+/mnt/demo/empty
+/mnt/demo/link
+/mnt/demo/sub
+/mnt/demo/sub/beta.txt
+run: /mnt/find exited with code 0
+pagh:rv64> run /mnt/find /mnt/demo -type f -ls
+000644        6       16 /mnt/demo/alpha.txt
+000644        5       20 /mnt/demo/sub/beta.txt
+run: /mnt/find exited with code 0
+pagh:rv64> run /mnt/find /mnt/demo -maxdepth 1
+/mnt/demo
+/mnt/demo/alpha.txt
+/mnt/demo/empty
+/mnt/demo/link
+/mnt/demo/sub
+run: /mnt/find exited with code 0
+pagh:rv64> cd /mnt/demo
+pagh:rv64> run /mnt/find .
+.
+./alpha.txt
+./empty
+./link
+./sub
+./sub/beta.txt
+run: /mnt/find exited with code 0
+pagh:rv64> cd /
+pagh:rv64> run /mnt/chdir
+chdir: before=/
+chdir: cwd=/mnt/demo
+chdir: alpha.txt=alpha
+chdir: . is_dir=true
+run: /mnt/chdir exited with code 0
+pagh:rv64> run /mnt/fsops
+fsops: read=alpha
+fsops: copied=5
+fsops: readlink=a.txt
+fsops: size=5 mode=0o644 ino=31 kind=File
+fsops: appended_len=14
+fsops: truncated_len=5
+fsops: sync_all unsupported=true
+fsops: create_new unsupported=true
+fsops: symlink_metadata unsupported=true
+fsops: canonicalize=/mnt/sdk-scratch/a.txt
+fsops: removed=true
+fsops: ok
+run: /mnt/fsops exited with code 0
+pagh:rv64> run /mnt/clock
+[tools/probes/examples/clock.rs:19:18] 40 + 2 = 42
+clock: dbg_return=42
+clock: monotonic_advanced=true
+clock: elapsed_ms=50
+clock: slept=true
+clock: uptime_ms=14670
+clock: ordering=true
+clock: ok
+run: /mnt/clock exited with code 0
+pagh:rv64> run /mnt/panic
+panic probe: about to panic with 3 values
+panic: panic at tools/probes/examples/panic.rs:15:5
+run: /mnt/panic exited with code 101
+pagh:rv64> run /mnt/oom
+oom probe: filling the 1 MiB brk heap
+oom: out of memory (brk failed); requested 1048576 bytes at alignment 1
+run: /mnt/oom exited with code 102
+pagh:rv64> run /mnt/cat
+console stdin works
+
+===== checks =====
+PASS  boot: shell prompt
+PASS  cat: first line
+PASS  cat: second line
+PASS  cat: exit 0
+PASS  cat: concatenates files
+PASS  cat: last line without newline
+PASS  cat multiple: exit 0
+PASS  cat: reports ENOENT
+PASS  cat missing: exit 1
+PASS  wc: 2 lines / 5 words / 33 bytes
+PASS  wc: exit 0
+PASS  wc -l: 200 lines
+PASS  wc -l: exit 0
+PASS  wc: first file row
+PASS  wc: second file row
+PASS  wc: total row
+PASS  wc total: exit 0
+PASS  wc -c: empty file is 0
+PASS  wc empty: exit 0
+PASS  find: /mnt/demo
+PASS  find: /mnt/demo/alpha.txt
+PASS  find: /mnt/demo/empty
+PASS  find: /mnt/demo/link
+PASS  find: /mnt/demo/sub
+PASS  find: /mnt/demo/sub/beta.txt
+PASS  find: exit 0
+PASS  find -ls: alpha metadata
+PASS  find -ls: beta metadata
+PASS  find -ls: filters out dirs
+PASS  find -ls: exit 0
+PASS  find -maxdepth: root
+PASS  find -maxdepth: subdir
+PASS  find -maxdepth: no grandchildren
+PASS  find -maxdepth: exit 0
+PASS  find .: root
+PASS  find .: relative child
+PASS  find .: relative grandchild
+PASS  find .: exit 0
+PASS  chdir: before
+PASS  chdir: tracked cwd
+PASS  chdir: relative read
+PASS  chdir: exit 0
+PASS  fsops: read
+PASS  fsops: readlink
+PASS  fsops: create_new Unsupported
+PASS  fsops: sync_all Unsupported
+PASS  fsops: cleaned up
+PASS  fsops: ok
+PASS  fsops: exit 0
+PASS  clock: monotonic advances
+PASS  clock: dbg return
+PASS  clock: debug macro
+PASS  clock: sleep
+PASS  clock: uptime
+PASS  clock: ok
+PASS  clock: exit 0
+PASS  panic: program: panic at location
+PASS  panic: exit 101
+PASS  oom: allocation failure
+PASS  oom: exit 102
+PASS  stdin: cat echoes console bytes
+PASS  stdin: cat has not exited (no EOF)
+62/62 checks passed
