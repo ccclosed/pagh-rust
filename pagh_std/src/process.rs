@@ -1,10 +1,10 @@
-//! Process lifetime and the (currently unsupported) process-spawning API.
+//! Process lifetime and spawning.
 //!
-//! pagh runs one process image at a time; the ABI has no `fork`, `exec`,
-//! `clone`, `wait`, signals or `mmap`. [`exit`] and [`abort`] are real;
-//! [`Command`] is a typed stub whose methods always return
-//! [`ErrorKind::Unsupported`](crate::io::ErrorKind::Unsupported) rather than
-//! pretending a process was started.
+//! The 0.16.0 ABI has `fork`/`execve`/`wait4`: [`fork`], [`execve`], [`wait`],
+//! [`getppid`] expose them, and [`Command`] is implemented on top (spawn, status,
+//! output with one stdout pipe). This is a single-process-image OS: the child
+//! shares nothing writable after fork (deep copy) and a socket fd is `ENOTSUP`
+//! in the child. There is no `SIGCHLD`; `wait` polls/blocks the syscall.
 //!
 //! A program is entered by the `libpagh` runtime as
 //! `extern "C" fn main(argc, argv, envp) -> i32`; its return value becomes the
@@ -56,10 +56,21 @@ impl ExitStatus {
         ExitStatus { code: Some(code) }
     }
 
-    /// An exit status that a signal would have produced; always `None` here,
-    /// because pagh has no signals.
+    /// An exit status that a signal would have produced.
     pub const fn from_signal(_signal: i32) -> ExitStatus {
         ExitStatus { code: None }
+    }
+
+    /// Decode a raw `wait4` status: low 7 bits signal, otherwise `code << 8`.
+    pub const fn from_raw(raw: i32) -> ExitStatus {
+        let signal = raw & 0x7f;
+        if signal == 0 {
+            ExitStatus {
+                code: Some(raw >> 8),
+            }
+        } else {
+            ExitStatus { code: None }
+        }
     }
 
     /// The exit code, if the process exited normally.
@@ -94,40 +105,85 @@ pub struct Output {
 }
 
 /// A child process handle.
-///
-/// It cannot be constructed by a user: [`Command::spawn`] always fails. The
-/// type exists so `Command`'s API has the std shape and so a future kernel with
-/// spawn can fill it in without changing call sites.
 #[derive(Debug)]
 pub struct Child {
-    _private: (),
+    pid: u32,
+    /// Read end of the captured stdout pipe, if any.
+    stdout: Option<i32>,
 }
 
 impl Child {
-    /// The child's pid; 0 because no child can exist.
+    /// The child's pid.
     pub const fn id(&self) -> u32 {
-        0
+        self.pid
     }
 
-    /// Unsupported without a wait syscall.
+    /// Wait for the child and decode its status.
     pub fn wait(&mut self) -> Result<ExitStatus> {
-        Err(Error::unsupported(
-            "Child::wait: the pagh ABI has no fork/exec/wait",
-        ))
+        if let Some(fd) = self.stdout.take() {
+            let _ = libpagh::sys::close(fd);
+        }
+        let (_, raw) = libpagh::sys::wait4(self.pid as i32, 0)?;
+        Ok(ExitStatus::from_raw(raw))
     }
 
-    /// Unsupported without signals.
-    pub fn kill(&mut self) -> Result<()> {
-        Err(Error::unsupported(
-            "Child::kill: the pagh ABI has no fork/exec/signals",
-        ))
-    }
-
-    /// Unsupported without a wait syscall.
+    /// Poll without blocking (`WNOHANG`); `Ok(None)` means still running.
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-        Err(Error::unsupported(
-            "Child::try_wait: the pagh ABI has no fork/exec/wait",
-        ))
+        let (pid, raw) = libpagh::sys::wait4(self.pid as i32, libpagh::sys::WNOHANG)?;
+        if pid == 0 {
+            return Ok(None);
+        }
+        if let Some(fd) = self.stdout.take() {
+            let _ = libpagh::sys::close(fd);
+        }
+        Ok(Some(ExitStatus::from_raw(raw)))
+    }
+
+    /// Send `SIGKILL` to the child.
+    pub fn kill(&mut self) -> Result<()> {
+        libpagh::sys::kill(self.pid as i32, libpagh::sys::SIGKILL)?;
+        Ok(())
+    }
+
+    /// Take the captured stdout pipe (used by [`Command::output`]).
+    pub fn take_stdout(&mut self) -> Option<i32> {
+        self.stdout.take()
+    }
+}
+
+/// `fork(2)`: returns the child pid in the parent and 0 in the child.
+pub fn fork() -> Result<u32> {
+    let pid = libpagh::sys::fork()?;
+    Ok(pid as u32)
+}
+
+/// `execve(2)`: replace the current image; returns only on error.
+pub fn execve(path: &str, argv: &[&str], envp: &[&str]) -> Result<()> {
+    libpagh::sys::execve(path, argv, envp)?;
+    Ok(())
+}
+
+/// `wait4(2)` without `WNOHANG`; returns the raw status.
+pub fn wait(pid: u32) -> Result<ExitStatus> {
+    let (_, raw) = libpagh::sys::wait4(pid as i32, 0)?;
+    Ok(ExitStatus::from_raw(raw))
+}
+
+/// `wait4(2)` with `WNOHANG`; `Ok(None)` when the child is still running.
+pub fn try_wait(pid: u32) -> Result<Option<ExitStatus>> {
+    let (child, raw) = libpagh::sys::wait4(pid as i32, libpagh::sys::WNOHANG)?;
+    if child == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(ExitStatus::from_raw(raw)))
+    }
+}
+
+/// `getppid(2)`.
+pub fn parent_id() -> u32 {
+    match libpagh::sys::getppid() {
+        Ok(pid) if pid >= 0 => pid as u32,
+        _ => 0,
     }
 }
 
@@ -231,25 +287,96 @@ impl Command {
         self.current_dir.as_deref()
     }
 
-    /// Unsupported: the ABI has no `fork`/`exec`.
-    pub fn status(&mut self) -> Result<ExitStatus> {
-        Err(Error::unsupported(
-            "Command::status: the pagh ABI has no fork/exec",
-        ))
+    fn argv(&self) -> Vec<&str> {
+        let mut argv = Vec::with_capacity(self.args.len() + 1);
+        argv.push(self.program.as_str());
+        argv.extend(self.args.iter().map(String::as_str));
+        argv
     }
 
-    /// Unsupported: the ABI has no `fork`/`exec`/`pipe`.
-    pub fn output(&mut self) -> Result<Output> {
-        Err(Error::unsupported(
-            "Command::output: the pagh ABI has no fork/exec/pipe",
-        ))
+    fn envp(&self) -> Vec<String> {
+        let mut envp = Vec::with_capacity(self.envs.len());
+        for (key, value) in &self.envs {
+            envp.push(alloc::format!("{key}={value}"));
+        }
+        envp
     }
 
-    /// Unsupported: the ABI has no `fork`/`exec`.
+    /// Spawn the child with stdout inherited.
     pub fn spawn(&mut self) -> Result<Child> {
-        Err(Error::unsupported(
-            "Command::spawn: the pagh ABI has no fork/exec",
-        ))
+        self.spawn_with_stdout(false)
+    }
+
+    fn spawn_with_stdout(&mut self, capture: bool) -> Result<Child> {
+        let pipe = if capture {
+            Some(libpagh::sys::pipe2()?)
+        } else {
+            None
+        };
+        let pid = libpagh::sys::fork()?;
+        if pid == 0 {
+            // Child: wire stdout and exec. Errors are reported on stderr and
+            // become 127; this process must not return into the parent's code.
+            if let Some([read, write]) = pipe {
+                let _ = libpagh::sys::close(read);
+                let _ = libpagh::sys::dup2(write, 1);
+                if write != 1 {
+                    let _ = libpagh::sys::close(write);
+                }
+            }
+            let envp = self.envp();
+            let env_refs: Vec<&str> = envp.iter().map(String::as_str).collect();
+            if libpagh::sys::execve(&self.program, &self.argv(), &env_refs).is_err() {
+                crate::io::_eprint(core::format_args!("{}: exec failed\n", self.program));
+                libpagh::sys::exit(127);
+            }
+            libpagh::sys::exit(127);
+        }
+        if let Some([read, write]) = pipe {
+            let _ = libpagh::sys::close(write);
+            Ok(Child {
+                pid: pid as u32,
+                stdout: Some(read),
+            })
+        } else {
+            Ok(Child {
+                pid: pid as u32,
+                stdout: None,
+            })
+        }
+    }
+
+    /// Run the child to completion and return its status.
+    pub fn status(&mut self) -> Result<ExitStatus> {
+        let mut child = self.spawn()?;
+        child.wait()
+    }
+
+    /// Run the child and capture stdout.
+    pub fn output(&mut self) -> Result<Output> {
+        let mut child = self.spawn_with_stdout(true)?;
+        let mut stdout = Vec::new();
+        if let Some(fd) = child.take_stdout() {
+            let mut buf = [0u8; 4096];
+            loop {
+                match libpagh::sys::read(fd, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) if n <= buf.len() => stdout.extend_from_slice(&buf[..n]),
+                    Ok(_) => break,
+                    Err(libpagh::Errno::EAGAIN) => {
+                        let _ = libpagh::sys::sched_yield();
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = libpagh::sys::close(fd);
+        }
+        let status = child.wait()?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        })
     }
 }
 

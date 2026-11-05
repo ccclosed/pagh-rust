@@ -260,11 +260,16 @@ kernel environment at startup, with `/` as the fallback.
 ### `pagh_std::process`
 
 `exit(code) -> !`, `abort() -> !` (prints `<program>: abort`, exits 134),
-`id()` (`getpid`), `ExitStatus`, `Output`, `Child`, `Command`.
+`id()` (`getpid`), `fork()`, `execve(path, argv, envp)`, `wait(pid)`,
+`try_wait(pid)`, `parent_id()`, `ExitStatus` (raw wait-status decoding),
+`Output`, `Child`, `Command`.
 
-`Command` stores its program/args/env/current_dir but `status`, `output` and
-`spawn` always return `ErrorKind::Unsupported`: the ABI has no
-`fork`/`exec`/`pipe`/`wait`.
+`Command::{spawn,status,output}` are real now: `spawn` forks, wires `stdout` to a
+pipe when capturing, and execs the program in the child; `status` runs and waits;
+`output` reads the pipe to EOF and returns stdout + status. There is no
+`SIGCHLD`, so `wait`/`wait4` is the only completion mechanism; `current_dir` on
+`Command` is not applied by the kernel (no chdir yet) and `env` maps to the
+execve `envp` array.
 
 ### `pagh_std::time`
 
@@ -355,11 +360,13 @@ Impossible without new kernel syscalls (shown with the SDK's typed
 
 - **`std::thread`/`Mutex`/`RwLock`/`Condvar`**: not `std`; `pagh_std::thread`
   provides native `Builder`/`JoinHandle`/futex, single-threaded `sync` only;
-- **processes**, `Command`, `fork`/`exec`/`wait`: no process model yet; signals
-  are in `pagh_std::signal`, pipes in the raw `libpagh` ABI;
-  syscalls; `Command::{status,output,spawn}` return `Unsupported`;
-- **networking**, `TcpStream`/`UdpSocket`/DNS: the kernel has a network stack
-  internally, but the frozen user ABI exposes no socket syscalls;
+- **processes without COW**: `fork` deep-copies user pages (no COW), the child's
+  socket fd is `ENOTSUP` (one TCP connection), and there is no `SIGCHLD`;
+  `Command::current_dir` is not applied (no `chdir` syscall); signals are in
+  `pagh_std::signal`;
+- **networking without a listener**: `pagh_std::net::TcpStream` can connect to an
+  IPv4 literal and read/write; there is no `UdpSocket`, `TcpListener`, DNS or
+  TLS in the ABI;
 - **dynamic linking**, `dlopen`, shared libraries: one static ELF, no loader;
 - **`OsStr`/`OsString` and non-UTF-8 paths**: the SDK stores UTF-8; directory
   names are decoded lossily (U+FFFD), so a non-UTF-8 filename cannot be opened

@@ -97,9 +97,15 @@ impl ErrorKind {
             Errno::EOVERFLOW => ErrorKind::FileTooLarge,
             Errno::ENOTSUP => ErrorKind::Unsupported,
             Errno::EPIPE => ErrorKind::BrokenPipe,
-            Errno::ENOTSOCK | Errno::EAFNOSUPPORT | Errno::ENETUNREACH
-            | Errno::EHOSTUNREACH | Errno::ECONNREFUSED | Errno::ECONNRESET
-            | Errno::EISCONN | Errno::ENOTCONN | Errno::ETIMEDOUT => ErrorKind::Uncategorized,
+            Errno::ENOTSOCK
+            | Errno::EAFNOSUPPORT
+            | Errno::ENETUNREACH
+            | Errno::EHOSTUNREACH
+            | Errno::ECONNREFUSED
+            | Errno::ECONNRESET
+            | Errno::EISCONN
+            | Errno::ENOTCONN
+            | Errno::ETIMEDOUT => ErrorKind::Uncategorized,
             Errno::ENOPROTOOPT => ErrorKind::Unsupported,
             Errno::Unknown => ErrorKind::Uncategorized,
         }
