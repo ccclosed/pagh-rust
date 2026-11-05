@@ -1,0 +1,8 @@
+# The same pinned nightly the kernel (`pagh-riscv`) and `libpagh` use, so the
+# SDK, the runtime and the kernel that loads the ELF are built by one compiler.
+# `rustfmt` is needed by CI; the precompiled `core` for the bare-metal RISC-V
+# target ships with this toolchain.
+[toolchain]
+channel = "nightly-2026-07-12"
+targets = ["riscv64gc-unknown-none-elf"]
+components = ["rustfmt"]

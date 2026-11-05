@@ -1,0 +1,29 @@
+[package]
+name = "pagh_probes"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Tiny diagnostic programs for the live QEMU transcript (panic and OOM exit codes)"
+
+[dependencies]
+pagh_std = { path = "../../pagh_std" }
+
+[[example]]
+name = "panic"
+path = "examples/panic.rs"
+
+[[example]]
+name = "oom"
+path = "examples/oom.rs"
+
+[[example]]
+name = "chdir"
+path = "examples/chdir.rs"
+
+[[example]]
+name = "fsops"
+path = "examples/fsops.rs"
+
+[[example]]
+name = "clock"
+path = "examples/clock.rs"

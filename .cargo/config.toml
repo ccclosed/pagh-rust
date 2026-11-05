@@ -1,0 +1,23 @@
+# `cargo build` in this workspace targets the pagh userland by default.
+#
+# The linker script is the SAME contract as `pagh-api/pagh-user.ld`: image at
+# 0x1_0000, `_start` first in `.text.entry`, R+X / R+W PT_LOADs, no TLS, no
+# dynamic sections. Cargo runs rustc with the workspace root as its working
+# directory, so the path is written relatively and the checkout stays
+# relocatable.
+#
+# This relative path assumes the documented sibling layout:
+#
+#     <parent>/pagh-rust   (this repository)
+#     <parent>/pagh-api    (libpagh + pagh-user.ld)
+#
+# `build.sh` honours `PAGH_API=/somewhere/pagh-api` instead; direct `cargo`
+# invocation requires the sibling. See README "Build".
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=-T../pagh-api/pagh-user.ld",
+    "-C", "linker=rust-lld",
+]

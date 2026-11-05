@@ -1,0 +1,31 @@
+[package]
+name = "pagh_std"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A std-like Rust layer over the pagh-riscv native ABI (libpagh)"
+license = "MIT"
+
+[lib]
+name = "pagh_std"
+path = "src/lib.rs"
+
+[dependencies]
+# The native userland runtime/syscall layer. This is a sibling checkout of
+# `pagh-api`; see the workspace README for `PAGH_API` and the sibling layout.
+libpagh = { path = "../../pagh-api/libpagh" }
+
+# The three real programs live at the repository root (`examples/`) so the SDK
+# and its examples read like one project, not like test fixtures hidden inside
+# the crate.
+[[example]]
+name = "cat"
+path = "../examples/cat.rs"
+
+[[example]]
+name = "wc"
+path = "../examples/wc.rs"
+
+[[example]]
+name = "find"
+path = "../examples/find.rs"

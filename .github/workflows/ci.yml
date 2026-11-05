@@ -1,0 +1,90 @@
+name: ci
+
+# Three gates, one job:
+#   * rustfmt for the whole workspace;
+#   * the SDK and all three examples built for riscv64gc-unknown-none-elf with
+#     the pinned toolchain, the pagh linker script and rust-lld;
+#   * host unit tests for the pure path/formatting logic, which is the only
+#     part of pagh_std that can be compiled for the host (libpagh contains
+#     RISC-V `ecall` assembly).
+#
+# pagh-rust and pagh-api are checked out as siblings because the Cargo
+# dependency and the linker script live in pagh-api. The toolchain is read from
+# rust-toolchain.toml, so bumping the pin is one line.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: fmt, build, host tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pagh-rust
+        uses: actions/checkout@v4
+        with:
+          path: pagh-rust
+
+      - name: Checkout pagh-api (sibling dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/pagh-api
+          ref: main
+          path: pagh-api
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        working-directory: pagh-rust
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          echo "rust-toolchain.toml pins: $channel"
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt \
+            --target riscv64gc-unknown-none-elf
+          rustup run "$channel" rustc --version
+
+      - name: Check formatting
+        working-directory: pagh-rust
+        # `cargo fmt --all` is documented to follow local path dependencies as
+        # well, and pagh-api is a sibling checkout this repository must not
+        # modify. Scope the gate to this workspace's three packages; their
+        # examples are targets of those packages and are covered too.
+        run: cargo fmt -p pagh_std -p pagh_hostcheck -p pagh_probes -- --check
+
+      - name: Build the SDK, examples and diagnostic probes
+        working-directory: pagh-rust
+        run: ./build.sh --fixtures
+
+      - name: Check the kernel 1 MiB image limit
+        working-directory: pagh-rust
+        run: |
+          set -euo pipefail
+          for elf in cat wc find; do
+            path="target/riscv64gc-unknown-none-elf/debug/examples/$elf"
+            size=$(wc -c <"$path")
+            echo "$path: $size bytes"
+            test "$size" -le 1048576
+          done
+
+      - name: Host tests for the pure path logic
+        working-directory: pagh-rust
+        run: cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu --locked
+
+      - name: Upload example ELFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagh-rust-examples
+          path: |
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/cat
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/wc
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/find
+          if-no-files-found: error
+          retention-days: 14
