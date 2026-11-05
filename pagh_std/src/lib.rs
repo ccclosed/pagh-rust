@@ -12,10 +12,11 @@
 //!
 //! `pagh_std` therefore does not claim to be `std`. It claims something
 //! narrower and testable: file I/O, directories, arguments/environment,
-//! monotonic time, paths, buffered I/O, formatting and exit codes, with the
-//! unsupported operations (`thread`, `process::spawn`, networking, `fsync`,
-//! `O_EXCL`, `OsStr`) exposed as typed `Unsupported` errors instead of silent
-//! stubs.
+//! monotonic time, paths, buffered I/O, formatting, exit codes, **native
+//! threads/futexes** ([`thread`]), a connected TCP client ([`net`]) and
+//! **signals** ([`signal`]). Operations the ABI cannot express
+//! (`process::spawn`, `fsync`, `O_EXCL`, `OsStr`) remain typed `Unsupported`
+//! errors instead of silent stubs.
 //!
 //! # Program shape
 //!
@@ -44,7 +45,8 @@
 //!
 //! # Runtime limits inherited from the ABI
 //!
-//! * one process, one image; no threads, `fork`, `exec`, signals or `wait`;
+//! * one process, one image; native threads exist (0.13.0) but no `fork`,
+//!   `exec` or `wait` yet;
 //! * 16 file descriptors (0/1/2 plus 13 opens) per run;
 //! * a 1 MiB `brk` heap, bump-allocated: `dealloc` is a no-op, memory is
 //!   returned only when the process exits;
@@ -92,9 +94,12 @@ pub mod fs;
 pub mod hash;
 pub mod io;
 pub mod panic;
+pub mod net;
 pub mod path;
 pub mod process;
+pub mod signal;
 pub mod sync;
+pub mod thread;
 pub mod time;
 
 pub use crate::error::{Error, ErrorKind};

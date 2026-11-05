@@ -19,7 +19,7 @@ What *is* fully real is **Rust the language** plus the `alloc` crate:
 - this crate's std-shaped layer over files, directories, arguments, paths,
   buffered I/O, time and process exit.
 
-`pagh_std` does **not** claim to be `std`, does not provide threads, processes,
+`pagh_std` does **not** claim to be `std`, does not provide processes,
 networking, dynamic linking or `OsStr`, and returns a typed
 `io::ErrorKind::Unsupported` for operations the ABI cannot express. Those are
 listed under [Limitations vs std](#limitations-vs-std).
@@ -353,9 +353,10 @@ than panicking.
 Impossible without new kernel syscalls (shown with the SDK's typed
 `Unsupported` answer where an API exists):
 
-- **threads**, `thread::spawn`, `Mutex`, `RwLock`, `Condvar`, atomics-based
-  synchronization: no `clone`/futex/threads; one process, one thread;
-- **processes**, `Command`, `fork`/`exec`/`wait`/`pipe`/signals: no such
+- **`std::thread`/`Mutex`/`RwLock`/`Condvar`**: not `std`; `pagh_std::thread`
+  provides native `Builder`/`JoinHandle`/futex, single-threaded `sync` only;
+- **processes**, `Command`, `fork`/`exec`/`wait`: no process model yet; signals
+  are in `pagh_std::signal`, pipes in the raw `libpagh` ABI;
   syscalls; `Command::{status,output,spawn}` return `Unsupported`;
 - **networking**, `TcpStream`/`UdpSocket`/DNS: the kernel has a network stack
   internally, but the frozen user ABI exposes no socket syscalls;
@@ -363,7 +364,8 @@ Impossible without new kernel syscalls (shown with the SDK's typed
 - **`OsStr`/`OsString` and non-UTF-8 paths**: the SDK stores UTF-8; directory
   names are decoded lossily (U+FFFD), so a non-UTF-8 filename cannot be opened
   by its exact bytes;
-- **`mmap`**, file mapping, `munmap`: absent; the only heap is `brk`;
+- **`mmap`** is available in the raw `libpagh` ABI (anonymous private pages);
+  `pagh_std` still exposes only the `brk` heap;
 - **`poll`/`select`/epoll**, `stdin` EOF: `read(0)` is non-blocking and never
   reports EOF; `io::Stdin` blocks by yielding, but `cat` with no file waits
   forever;

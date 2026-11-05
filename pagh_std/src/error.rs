@@ -56,6 +56,8 @@ pub enum ErrorKind {
     InvalidFilename,
     /// Too many symbolic links (`ELOOP`).
     FilesystemLoop,
+    /// The other end of a pipe/socket is gone (`EPIPE`).
+    BrokenPipe,
     /// A file size or offset does not fit the ABI's integer (`EOVERFLOW`).
     FileTooLarge,
     /// The descriptor does not refer to an open file (`EBADF`).
@@ -94,6 +96,11 @@ impl ErrorKind {
             Errno::ELOOP => ErrorKind::FilesystemLoop,
             Errno::EOVERFLOW => ErrorKind::FileTooLarge,
             Errno::ENOTSUP => ErrorKind::Unsupported,
+            Errno::EPIPE => ErrorKind::BrokenPipe,
+            Errno::ENOTSOCK | Errno::EAFNOSUPPORT | Errno::ENETUNREACH
+            | Errno::EHOSTUNREACH | Errno::ECONNREFUSED | Errno::ECONNRESET
+            | Errno::EISCONN | Errno::ENOTCONN | Errno::ETIMEDOUT => ErrorKind::Uncategorized,
+            Errno::ENOPROTOOPT => ErrorKind::Unsupported,
             Errno::Unknown => ErrorKind::Uncategorized,
         }
     }
