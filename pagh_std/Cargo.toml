@@ -1,6 +1,6 @@
 [package]
 name = "pagh_std"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 publish = false
 description = "A std-like Rust layer over the pagh-riscv native ABI (libpagh)"
@@ -29,3 +29,10 @@ path = "../examples/wc.rs"
 [[example]]
 name = "find"
 path = "../examples/find.rs"
+[[example]]
+name = "threads_mutex"
+path = "../examples/threads_mutex.rs"
+
+[[example]]
+name = "spawn"
+path = "../examples/spawn.rs"

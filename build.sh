@@ -95,7 +95,7 @@ fi
 EXAMPLE_DIR="$ROOT/target/$TARGET/$PROFILE_DIR/examples"
 echo
 echo "ELF outputs (kernel image limit: 1 MiB):"
-for name in cat wc find; do
+for name in cat wc find threads_mutex spawn; do
     path="$EXAMPLE_DIR/$name"
     if [ ! -f "$path" ]; then
         echo "build.sh: expected $path to exist" >&2
@@ -120,3 +120,5 @@ echo "Run them in the guest (see README):"
 echo "  run /mnt/cat /mnt/hello.txt"
 echo "  run /mnt/wc /mnt/lines.txt"
 echo "  run /mnt/find /mnt/demo"
+echo "  run /mnt/threads_mutex"
+echo "  run /mnt/spawn"

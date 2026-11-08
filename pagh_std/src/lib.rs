@@ -93,6 +93,7 @@ pub mod fmt;
 pub mod fs;
 pub mod hash;
 pub mod io;
+pub mod mem;
 pub mod net;
 pub mod panic;
 pub mod path;

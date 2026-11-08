@@ -310,10 +310,10 @@ be a lie. The `HashMap` shim does not consult the hasher.
 
 ### `pagh_std::sync`
 
-`Cell`, `RefCell`, `OnceCell`, `UnsafeCell` from `core::cell`, plus a
-single-threaded `LazyLock<T, F>` whose initializer is `Fn` (not `FnOnce`).
-There is deliberately **no `Mutex` or `RwLock`**: there is exactly one thread
-and no wait primitive, so those types would be misleading.
+`Cell`, `RefCell`, `OnceCell`, `UnsafeCell` from `core::cell`, a
+single-threaded `LazyLock<T, F>`, and **real futex-backed `Mutex<T>`/`RwLock<T>`**
+(non-poisoning, process-private; guards implement `Deref`/`DerefMut`). They work
+with native threads and sleep on the futex word rather than spinning.
 
 ### `pagh_std::fmt`, `panic`, `ffi`
 
@@ -358,7 +358,7 @@ than panicking.
 Impossible without new kernel syscalls (shown with the SDK's typed
 `Unsupported` answer where an API exists):
 
-- **`std::thread`/`Mutex`/`RwLock`/`Condvar`**: not `std`; `pagh_std::thread`
+- **`std::thread`/`Condvar`**: not `std`; `pagh_std::thread`
   provides native `Builder`/`JoinHandle`/futex, single-threaded `sync` only;
 - **processes without COW**: `fork` deep-copies user pages (no COW), the child's
   socket fd is `ENOTSUP` (one TCP connection), and there is no `SIGCHLD`;

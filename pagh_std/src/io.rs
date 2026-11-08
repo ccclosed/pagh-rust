@@ -933,3 +933,26 @@ pub fn repeat(byte: u8) -> Repeat {
 pub fn sink() -> Sink {
     Sink
 }
+
+/// A `poll(2)` descriptor from the native ABI.
+pub use libpagh::abi::PollFd;
+
+/// Poll descriptors for readiness.
+///
+/// `timeout` is a blocking timeout; `None` waits forever. Returns the number of
+/// ready descriptors (0 on timeout). The kernel's poll is non-blocking per
+/// descriptor and yields in the syscall for the timeout.
+pub fn poll(fds: &mut [PollFd], timeout: Option<crate::time::Duration>) -> Result<usize> {
+    let millis = match timeout {
+        Some(d) => {
+            let ms = d.as_millis();
+            if ms > i32::MAX as u128 {
+                i32::MAX
+            } else {
+                ms as i32
+            }
+        }
+        None => -1,
+    };
+    libpagh::sys::poll(fds, millis).map_err(|e| Error::from(e))
+}
