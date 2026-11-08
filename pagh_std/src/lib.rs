@@ -8,14 +8,15 @@
 //! What *is* fully real is **Rust the language** — generics, traits, closures,
 //! iterators, pattern matching, `core`, `alloc`, `Vec`, `String`, `format!`,
 //! `BTreeMap`, `BinaryHeap` — plus this crate's std-shaped wrappers over the
-//! 22-syscall native ABI.
+//! native ABI.
 //!
 //! `pagh_std` therefore does not claim to be `std`. It claims something
 //! narrower and testable: file I/O, directories, arguments/environment,
 //! monotonic time, paths, buffered I/O, formatting, exit codes, **native
-//! threads/futexes** ([`thread`]), a connected TCP client ([`net`]) and
-//! **signals** ([`signal`]). Operations the ABI cannot express
-//! (`process::spawn`, `fsync`, `O_EXCL`, `OsStr`) remain typed `Unsupported`
+//! threads/futexes and scoped threads** ([`thread`]), **mutexes, rwlocks and
+//! condition variables** ([`sync`]), a connected TCP client ([`net`]) and
+//! **signals** ([`signal`]). Operations the ABI cannot express (`fsync`,
+//! `O_EXCL`, `dup`, `OsStr`, dynamic linking) remain typed `Unsupported`
 //! errors instead of silent stubs.
 //!
 //! # Program shape
@@ -45,8 +46,7 @@
 //!
 //! # Runtime limits inherited from the ABI
 //!
-//! * one process, one image; native threads exist (0.13.0) but no `fork`,
-//!   `exec` or `wait` yet;
+//! * one process image per run, with native threads (no TLS, no unwinding);
 //! * 16 file descriptors (0/1/2 plus 13 opens) per run;
 //! * a 1 MiB `brk` heap, bump-allocated: `dealloc` is a no-op, memory is
 //!   returned only when the process exits;
@@ -54,7 +54,7 @@
 //! * console `read(0)` is non-blocking and has no EOF (the `io::Stdin` handle
 //!   hides the non-blocking part by yielding, but EOF never arrives);
 //! * no `statat`, `O_EXCL`, `O_DIRECTORY`, `O_NOFOLLOW`, `fsync`, `dup`,
-//!   `mmap`, `poll`, sockets, RTC or dynamic linker.
+//!   RTC or dynamic linker; one connected TCP client at a time and no listener.
 //!
 //! # Modules
 //!
@@ -63,11 +63,13 @@
 //! | [`io`] | `Read`, `Write`, `Seek`, `BufRead`, `BufReader`, `BufWriter`, stdin/stdout/stderr, `copy`, `read_to_end`, `read_to_string`, `Error`/`ErrorKind` |
 //! | [`fs`] | `File`, `OpenOptions`, `ReadDir`/`Dir`, `DirEntry`, `FileType`, `Metadata`, read/write/copy, mkdir/remove/rename/link/symlink/readlink, lexical `canonicalize` |
 //! | [`env`] | `args`, `args_os` (lossy), `vars`, `var`, `current_dir`, `set_current_dir` (process-local), `temp_dir` |
-//! | [`process`] | `exit`, `abort`, `id`, and a typed-`Unsupported` `Command` |
+//! | [`process`] | `exit`, `abort`, `id`, `fork`/`execve`/`wait`, `Command` spawn/status/output |
 //! | [`time`] | `Duration`, monotonic `Instant`, uptime-based `SystemTime`, `UNIX_EPOCH`, `sleep` |
 //! | [`path`] | `Path`, `PathBuf`, `Component`, `Components`, lexical `normalize`/`normalize_join` |
 //! | [`collections`] | `Vec`, `String`, `VecDeque`, `BTreeMap`, `BTreeSet`, `BinaryHeap`, `HashMap`/`HashSet` shims |
-//! | [`sync`] | `Cell`, `RefCell`, `OnceCell`, single-threaded `LazyLock`; deliberately no `Mutex`/`RwLock` |
+//! | [`sync`] | `Cell`, `RefCell`, `OnceCell`, `LazyLock`, futex-backed `Mutex`/`RwLock`/`Condvar` |
+//! | [`thread`] | native `Builder`/`JoinHandle`, futex wait/wake, `thread::scope` with borrowed closures |
+//! | [`net`] | `Ipv4`, a connected `TcpStream` with blocking `Read`/`Write`/`BufRead` |
 //! | [`fmt`] | `core::fmt` re-exports; `print!`, `println!`, `eprint!`, `eprintln!`, `dbg!`, `format!`, `vec!`, `write!`, `writeln!` |
 //! | [`panic`] | `PanicInfo`, `abort`; the handler contract and why `libpagh` owns it |
 //! | [`ffi`] | `c_*` types and `CStr`/`CString` for a future C boundary |
@@ -76,7 +78,7 @@
 //!
 //! The crate needs a sibling checkout of `pagh-api` (for `libpagh` and
 //! `pagh-user.ld`) and the pinned `nightly-2026-07-12` toolchain. From the
-//! repository root, `./build.sh` builds the three example ELFs; see the
+//! repository root, `./build.sh` builds the example ELFs; see the
 //! repository README for `PAGH_API`, QEMU and the live transcript.
 
 #![no_std]
@@ -84,6 +86,8 @@
 #![warn(missing_docs)]
 
 extern crate alloc;
+
+mod lazy;
 
 pub mod collections;
 pub mod env;

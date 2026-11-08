@@ -10,7 +10,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     match Command::new("/mnt/hello").status() {
         Ok(status) => {
             println!("child status: {status}");
-            if status.success() { 0 } else { 1 }
+            if status.success() {
+                0
+            } else {
+                1
+            }
         }
         Err(error) => {
             eprintln!("spawn failed: {error}");

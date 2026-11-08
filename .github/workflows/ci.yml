@@ -2,9 +2,9 @@ name: ci
 
 # Three gates, one job:
 #   * rustfmt for the whole workspace;
-#   * the SDK and all three examples built for riscv64gc-unknown-none-elf with
-#     the pinned toolchain, the pagh linker script and rust-lld;
-#   * host unit tests for the pure path/formatting logic, which is the only
+#   * the SDK and all examples built for riscv64gc-unknown-none-elf with the
+#     pinned toolchain, the pagh linker script and rust-lld;
+#   * host unit tests for the pure path/hash/LazyLock logic, which is the only
 #     part of pagh_std that can be compiled for the host (libpagh contains
 #     RISC-V `ecall` assembly).
 #
@@ -67,7 +67,7 @@ jobs:
         working-directory: pagh-rust
         run: |
           set -euo pipefail
-          for elf in cat wc find; do
+          for elf in cat wc find threads_mutex spawn condvar io_traits; do
             path="target/riscv64gc-unknown-none-elf/debug/examples/$elf"
             size=$(wc -c <"$path")
             echo "$path: $size bytes"
@@ -86,5 +86,9 @@ jobs:
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/cat
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/wc
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/find
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/threads_mutex
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/spawn
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/condvar
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/io_traits
           if-no-files-found: error
           retention-days: 14

@@ -7,8 +7,8 @@ in U-mode with `run /mnt/...`.
 ## The honest scope
 
 A full `rustc`/`std` **cannot** run on this OS. Compiling Rust needs LLVM and a
-host operating system; `std` assumes libc, threads, a signal stack, `mmap`, a
-wall clock and a dynamic loader that the 22-syscall pagh ABI does not have.
+host operating system; `std` assumes libc, a C runtime, unwinding, a signal
+stack, a wall clock and a dynamic loader that the pagh ABI does not have.
 
 What *is* fully real is **Rust the language** plus the `alloc` crate:
 
@@ -17,17 +17,22 @@ What *is* fully real is **Rust the language** plus the `alloc` crate:
 - `format!`, `println!`, `write!` and the rest of `core::fmt`;
 - a 1 MiB bump heap over `brk`, with `Vec`/`String` growth and OOM handling;
 - this crate's std-shaped layer over files, directories, arguments, paths,
-  buffered I/O, time and process exit.
+  buffered I/O, time, process exit, native/scoped threads, synchronisation,
+  signals and a connected TCP client.
 
-`pagh_std` does **not** claim to be `std`, does not provide processes,
-networking, dynamic linking or `OsStr`, and returns a typed
-`io::ErrorKind::Unsupported` for operations the ABI cannot express. Those are
-listed under [Limitations vs std](#limitations-vs-std).
+`pagh_std` does **not** claim to be `std`, does not provide dynamic linking or
+`OsStr`, and returns a typed `io::ErrorKind::Unsupported` for operations the
+ABI cannot express. Those are listed under
+[Limitations vs std](#limitations-vs-std).
 
-**Live evidence:** [`docs/live-rust-sdk.txt`](docs/live-rust-sdk.txt) is a
-QEMU serial transcript (kernel 0.11.0, RISC-V `virt`, a 64 MiB ext2 image) with
-62/62 checks: all three examples, relative paths, filesystem mutations,
-metadata, symlinks, `panic` exit 101 and OOM exit 102, plus console stdin.
+**Live evidence:** [`docs/live-sdk-0.5.0.txt`](docs/live-sdk-0.5.0.txt) is the
+QEMU serial transcript for this release: `CONDVAR PASS` (4 waiters released by
+`notify_all`, an exact `notify_one`, a 50 ms `wait_timeout`, and `thread::scope`
+with borrowed `&mut` stack slots) and `IO_TRAITS PASS` (`File` through
+`Read`/`Write`/`Seek`/`BufRead`, plus `TcpStream` through `Write`/`BufRead`/`Read`
+against a host server over QEMU user networking). The earlier
+[`docs/live-rust-sdk.txt`](docs/live-rust-sdk.txt) remains the 62/62 transcript
+for the 0.4.0 surface (kernel 0.11.0).
 
 ## Repository layout
 
@@ -44,19 +49,23 @@ pagh_std/src/
   env.rs                   args/vars/PWD tracking/temp_dir
   path.rs                  UTF-8 Path/PathBuf/Components + lexical normalize
   time.rs                  Duration, Instant, SystemTime, sleep
-  process.rs               exit/abort/Command (typed Unsupported)
+  process.rs               exit/abort/fork/execve/wait/Command
   collections/             alloc containers + HashMap/HashSet BTree shims
   hash.rs                  core::hash re-exports + deterministic hasher
-  sync.rs                  Cell/RefCell/OnceCell/LazyLock
+  lazy.rs                  single-threaded LazyLock (pure core; host-tested)
+  sync.rs                  Cell/RefCell/OnceCell + futex Mutex/RwLock/Condvar
+  thread.rs                Builder/JoinHandle/futex + thread::scope
+  net.rs                   Ipv4 + blocking Read/Write/BufRead TcpStream
   fmt.rs                   core::fmt re-exports
   panic.rs                 PanicInfo/abort + the runtime contract
   ffi.rs                   c_* types, CStr/CString
-examples/                  cat.rs, wc.rs, find.rs (real #![no_std] programs)
-hostcheck/                 host cargo test for the pure path logic
+examples/                  cat, wc, find, threads_mutex, spawn, condvar, io_traits
+hostcheck/                 host cargo test for path/hash/LazyLock logic
 tools/probes/              panic/oom/chdir/fsops/clock diagnostic programs
 tools/live_check.py        builds, boots QEMU, runs everything, saves transcript
 .github/workflows/ci.yml   fmt + RISC-V build + host tests
-docs/live-rust-sdk.txt     the captured live run
+docs/live-rust-sdk.txt     the 0.4.0 captured live run
+docs/live-sdk-0.5.0.txt    the 0.5.0 condvar/io-traits captured runs
 ```
 
 ## A program
@@ -122,6 +131,10 @@ Outputs (the kernel refuses images above 1 MiB; these are ~140–250 KiB):
 target/riscv64gc-unknown-none-elf/debug/examples/cat
 target/riscv64gc-unknown-none-elf/debug/examples/wc
 target/riscv64gc-unknown-none-elf/debug/examples/find
+target/riscv64gc-unknown-none-elf/debug/examples/threads_mutex
+target/riscv64gc-unknown-none-elf/debug/examples/spawn
+target/riscv64gc-unknown-none-elf/debug/examples/condvar
+target/riscv64gc-unknown-none-elf/debug/examples/io_traits
 ```
 
 Equivalent Cargo invocation:
@@ -157,7 +170,7 @@ Use the kernel from `pagh-riscv` and a host-built ext2 image:
 
 ```sh
 mkdir -p rootfs/demo/sub
-cp target/riscv64gc-unknown-none-elf/debug/examples/{cat,wc,find} rootfs/
+cp target/riscv64gc-unknown-none-elf/debug/examples/{cat,wc,find,condvar,io_traits} rootfs/
 printf 'hello from pagh-rust\nsecond line\n' > rootfs/hello.txt
 printf 'alpha\n' > rootfs/demo/alpha.txt
 printf 'beta\n'  > rootfs/demo/sub/beta.txt
@@ -179,6 +192,9 @@ run /mnt/wc /mnt/hello.txt
 run /mnt/wc -l /mnt/lines.txt
 run /mnt/find /mnt/demo
 run /mnt/find /mnt/demo -type f -ls
+run /mnt/condvar
+run /mnt/io_traits
+run /mnt/io_traits net 10.0.2.2 18080   # with --net and a host server
 ```
 
 The shell has no quoting or redirection, so an argument cannot contain a
@@ -198,7 +214,7 @@ types every command byte by byte, checks output and exit codes, runs the
 console-stdin case, and rewrites `docs/live-rust-sdk.txt`. `--kernel`,
 `--api`, `--skip-build`, `--keep` and `--output` are available.
 
-The last run: **62/62 checks passed** against
+The last full run (tag 0.4.0): **62/62 checks passed** against
 `pagh-riscv 0.11.0` / QEMU 10.2.2. The transcript is the source of truth; the
 summary includes `cat`, `wc`, `find`, relative paths after `cd`, `fsops`
 (mkdir/write/copy/rename/hard link/symlink/readlink/truncate/remove),
@@ -207,20 +223,43 @@ Console stdin is tested last: `cat` with no arguments echoes `console stdin
 works`, then keeps waiting because the ABI has no EOF; the script terminates
 QEMU itself.
 
+For 0.5.0, the focused live check was the requested explicit QEMU invocation:
+
+```sh
+truncate -s 64M disk.img
+mke2fs -q -t ext2 -F -b 4096 -d rootfs disk.img
+cd ../pagh-riscv
+python3 tools/run.py --disk /tmp/pagh-rust.img \
+  --keys 'run /mnt/condvar\nrun /mnt/io_traits\nhalt\n' \
+  --settle 40 --serial-log /tmp/pagh-rust-serial.log
+```
+
+On the default debug kernel both programs print `PASS` and exit 0; the exact
+serial text is in `docs/live-sdk-0.5.0.txt`. A second run with `--net` and a
+host echo server proves the `TcpStream` trait path.
+
 ## API surface
 
 ### `pagh_std::io`
 
 | Item | Notes |
 |---|---|
-| `Read` | `read`, `read_to_end`, `read_to_string`, `read_exact`, `bytes`, `take`, `by_ref`; implemented for `File`, `Stdin`, `BufReader`, `&[u8]`, `&mut R` |
-| `Write` | `write`, `flush`, `write_all`, `write_fmt`, `by_ref`; `File`, `Stdout`, `Stderr`, `BufWriter`, `&mut W` |
+| `Read` | `read`, `read_to_end`, `read_to_string`, `read_exact`, `bytes`, `take`, `by_ref`; implemented for `File`, `TcpStream`, `Stdin`, `BufReader`, `&[u8]`, `&mut R` |
+| `Write` | `write`, `flush`, `write_all`, `write_fmt`, `by_ref`; `File`, `TcpStream`, `Stdout`, `Stderr`, `BufWriter`, `&mut W` |
 | `Seek`, `SeekFrom` | `seek`, `stream_position`, `rewind`, `seek_relative`; regular files |
-| `BufRead`, `BufReader`, `BufWriter` | `fill_buf`, `consume`, `read_until`, `read_line`, `lines`, `split`; 8 KiB default buffer, `with_capacity`, `into_inner`, `get_ref`, `get_mut` |
+| `BufRead`, `BufReader`, `BufWriter` | `fill_buf`, `consume`, `read_until`, `read_line`, `lines`, `split`; 8 KiB default buffer, `with_capacity`, `into_inner`, `get_ref`, `get_mut`; also implemented directly on `File` and `TcpStream` |
 | `stdin`, `stdout`, `stderr` | console handles; `Stdin::read` blocks by retrying `EAGAIN` with `sched_yield`; output retries `EAGAIN` too |
 | `read_to_end`, `read_to_string`, `copy` | free functions over `Read`/`Write` |
 | `empty`, `repeat`, `sink` | trivial adapters |
 | `Error`, `ErrorKind`, `Result` | `Error` wraps `libpagh::errno::Errno`, keeps the raw number, maps to std-shaped kinds; `Unsupported` is the typed "ABI cannot do this" |
+
+`BufRead` on `File` and `TcpStream` is a pagh extension (`std` implements it
+for `BufReader`, not for those concrete types). `fill_buf` reads ahead into an
+8 KiB internal buffer; `Read` drains that buffer, `Seek` accounts for it, and
+`File::write` rewinds over unread bytes first. `BufReader` remains the explicit
+buffering layer for streaming. On a `TcpStream`, `Read`/`Write` block by
+retrying `EAGAIN` with `sched_yield` (the ABI's `recv`/`send` are
+non-blocking).
 
 `write!`/`writeln!` are the core prelude macros; they call
 `Write::write_fmt`, so they work with every `pagh_std` sink. `println!`-style
@@ -231,7 +270,7 @@ macros ignore write errors (there is no useful recovery on fd 1); use
 
 | Item | Notes |
 |---|---|
-| `File` | `open`, `create`, `create_new` (always `Unsupported`), `options`, `metadata`, `set_len`, `as_raw_fd`, `into_raw_fd`, `unsafe from_raw_fd`, `Read`/`Write`/`Seek`, closes on drop |
+| `File` | `open`, `create`, `create_new` (always `Unsupported`), `options`, `metadata`, `set_len`, `as_raw_fd`, `into_raw_fd`, `unsafe from_raw_fd`, `Read`/`Write`/`Seek`/`BufRead`, closes on drop |
 | `OpenOptions` | read/write/append/create/truncate/mode; `create_new` returns `Unsupported` (no `O_EXCL`) |
 | `ReadDir` (`Dir`) | iterator over `getdents64`, filters `.` and `..`, yields `Result<DirEntry>`; `read_dir(path)` |
 | `DirEntry` | `path`, `file_name`, `file_type`, `ino`, `metadata` (follows symlinks) |
@@ -315,6 +354,43 @@ single-threaded `LazyLock<T, F>`, and **real futex-backed `Mutex<T>`/`RwLock<T>`
 (non-poisoning, process-private; guards implement `Deref`/`DerefMut`). They work
 with native threads and sleep on the futex word rather than spinning.
 
+`Condvar` is the std shape: `wait(guard)` releases the mutex, blocks on a
+per-condvar futex sequence word, and re-acquires the mutex before returning;
+`wait_timeout(guard, duration)` also returns a `WaitTimeoutResult`;
+`notify_one` advances the sequence and wakes one waiter; `notify_all` wakes
+every waiter. Deviations are documented on the type: no poisoning; a signal
+(`EINTR`) or a full kernel futex table makes a wait return spuriously (re-check
+the predicate); timeouts round **up** to the 10 ms kernel tick; there is no
+realtime-clock futex. The kernel tracks at most 32 waiters and 16 futex
+addresses per boot.
+
+The timed wait builds its own `Timespec` on the call frame. This is deliberate:
+`libpagh::thread::futex_wait` (0.1.0) points the kernel at a temporary that is
+already dead by syscall time, so a timed wait reads an arbitrary stack value;
+the SDK-side workaround is covered by the live `wait_timeout` check.
+
+### `pagh_std::thread`
+
+`Builder`, `JoinHandle`, `DEFAULT_STACK_SIZE`, `current_id`, `yield_now`,
+`exit`, `exit_group`, `futex_wait`/`futex_wake`, and **`thread::scope`**.
+
+`thread::scope` is std-shaped: the closure gets a `Scope`, `Scope::spawn`
+accepts a closure that borrows stack data, the returned `ScopedJoinHandle::join`
+returns the closure's value, and unjoined threads are joined automatically
+before `scope` returns. `Scope::try_spawn` is the fallible form. Deviations:
+`panic = "abort"` means no unwind or panic payload; the scope handle is
+single-threaded (spawn from the thread that called `scope`); there is no
+`Builder::spawn_scoped`. The implementation erases the closure's lifetime to
+satisfy `libpagh`'s `'static` builder and joins every child before the borrows
+can end; the `SAFETY` comments in `thread.rs` state that invariant.
+
+### `pagh_std::net`
+
+`Ipv4` (literal parse/format) and `TcpStream`: `connect`, `fd`, `shutdown`,
+`read_to_end`, plus `Read`/`Write`/`BufRead` with blocking retry semantics.
+`TcpStream` is a thin pagh_std wrapper over `libpagh::net::TcpStream`; the ABI
+still has one connected client, no listener/accept, UDP, IPv6, DNS or TLS.
+
 ### `pagh_std::fmt`, `panic`, `ffi`
 
 - `fmt` re-exports `core::fmt` (`Debug`, `Display`, `Formatter`, `Arguments`,
@@ -358,15 +434,19 @@ than panicking.
 Impossible without new kernel syscalls (shown with the SDK's typed
 `Unsupported` answer where an API exists):
 
-- **`std::thread`/`Condvar`**: not `std`; `pagh_std::thread`
-  provides native `Builder`/`JoinHandle`/futex, single-threaded `sync` only;
+- **`std::thread`/scoped threads**: `pagh_std::thread` provides native
+  `Builder`/`JoinHandle`/futex and `thread::scope`, but no TLS, no unwinding,
+  no `Builder::spawn_scoped`, and no way to spawn from a sibling thread through
+  the same `Scope`;
+- **`Condvar` edge cases**: non-poisoning, no realtime-clock timeout, 10 ms
+  timeout granularity, and spurious returns on signal/futex-table pressure;
 - **processes without COW**: `fork` deep-copies user pages (no COW), the child's
   socket fd is `ENOTSUP` (one TCP connection), and there is no `SIGCHLD`;
   `Command::current_dir` is not applied (no `chdir` syscall); signals are in
   `pagh_std::signal`;
 - **networking without a listener**: `pagh_std::net::TcpStream` can connect to an
-  IPv4 literal and read/write; there is no `UdpSocket`, `TcpListener`, DNS or
-  TLS in the ABI;
+  IPv4 literal and read/write (blocking through the SDK traits); there is no
+  `UdpSocket`, `TcpListener`, DNS or TLS in the ABI;
 - **dynamic linking**, `dlopen`, shared libraries: one static ELF, no loader;
 - **`OsStr`/`OsString` and non-UTF-8 paths**: the SDK stores UTF-8; directory
   names are decoded lossily (U+FFFD), so a non-UTF-8 filename cannot be opened
@@ -407,16 +487,19 @@ transcript.
 - **Every `unsafe` site has a `SAFETY:` comment.** The surface is the
   `Path`/`PathBuf` `#[repr(transparent)]` casts, the single-threaded `PWD` cell
   (`unsafe impl Sync` plus its two accesses), `BufWriter::into_inner`'s
-  bitwise move, and `File::from_raw_fd`'s documented ownership contract. The
-  crate is `#![deny(unsafe_op_in_unsafe_fn)]`.
+  bitwise move, `File::from_raw_fd`'s documented ownership contract, and the
+  lifetime-erasing raw pointers in `thread::scope` (sound because the scope
+  joins every child). The crate is `#![deny(unsafe_op_in_unsafe_fn)]`.
 - **Absolute paths at the boundary.** Every filesystem entry point calls
   `resolve_path` (against the tracked `PWD`, lexically normalized), because the
   kernel accepts absolute paths only.
 - **The ABI is the contract.** Syscall numbers, `Stat`, `Timespec`, `Uname`,
   `Dirent` sizes and flags live in `libpagh`; `pagh_std` uses its wrappers,
   not hand-written `ecall`s.
-- **Buffering is userland.** `File` is unbuffered; `BufReader`/`BufWriter` add
-  the 8 KiB layer and are what the examples use for streaming.
+- **Buffering is userland.** `File` is unbuffered on the `read`/`write` path;
+  `BufReader`/`BufWriter` add the explicit 8 KiB layer. `File`/`TcpStream` also
+  carry an 8 KiB read-ahead buffer for their direct `BufRead` implementation,
+  which is allocated only when `fill_buf` is used.
 
 ## Verification summary
 
@@ -435,9 +518,14 @@ The transcript covers:
 | time | `clock` probe: monotonic advance, `nanosleep`, uptime |
 | panic/OOM | `panic` → 101; `oom` → 102 |
 | stdin | `cat` no args echoes console input and stays alive (no EOF) |
+| Condvar | 0.5.0 transcript: 4 waiters + `notify_all`, exact `notify_one`, 50 ms `wait_timeout`, guard re-locked |
+| scoped threads | 0.5.0 transcript: `thread::scope` joins explicit and dropped handles, returns values, borrows `&mut` slots |
+| File traits | 0.5.0 transcript: `write_all`/`flush`/`seek`, `read_exact`/`read_to_end`, direct `BufRead` and read-ahead/write rewind |
+| TCP traits | 0.5.0 network run: `TcpStream` `write_all`, `read_line`, `Read::read_to_end` against a host server |
 
-`python3 tools/live_check.py` reproduces it; `docs/live-rust-sdk.txt` is the
-captured run with the kernel hash and QEMU/toolchain versions in its header.
+`python3 tools/live_check.py` reproduces the 0.4.0 matrix;
+`docs/live-rust-sdk.txt` is that captured run. `docs/live-sdk-0.5.0.txt` is the
+focused 0.5.0 run with its kernel/QEMU/toolchain header.
 
 ## CI
 
@@ -450,7 +538,7 @@ captured run with the kernel hash and QEMU/toolchain versions in its header.
 4. runs `./build.sh --fixtures` (all examples and probes);
 5. asserts every example is ≤ 1 MiB;
 6. runs `cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu --locked`;
-7. uploads the three example ELFs.
+7. uploads the example ELFs.
 
 The live QEMU check is intentionally not in CI: it needs the kernel checkout
 and QEMU, and the transcript is the acceptance artifact for this milestone.

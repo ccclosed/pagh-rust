@@ -13,7 +13,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::path::{Path, PathBuf};
 
 /// Terminate the process with `code`.

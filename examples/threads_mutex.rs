@@ -33,5 +33,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     }
     let value = *counter.lock();
     println!("counter={value}");
-    if value == 1000 { 0 } else { 1 }
+    if value == 1000 {
+        0
+    } else {
+        1
+    }
 }

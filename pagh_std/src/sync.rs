@@ -1,86 +1,14 @@
-//! A single-threaded `LazyLock`, plus the `core::cell` types under std names.
+//! A single-threaded `LazyLock`, plus the `core::cell` types under std names,
+//! and the kernel-0.13+ futex-backed synchronisation primitives.
 //!
-//! Since kernel 0.13 the ABI has native threads and futexes, so this module also
-//! provides real [`Mutex`] and [`RwLock`] primitives (at the bottom of the
-//! file); the legacy single-threaded `LazyLock`/`Cell` types stay for programs
-//! that do not spawn threads.
+//! [`LazyLock`] itself lives in the crate-internal `lazy` module so the host
+//! checker can include that file without `libpagh`; it is re-exported here. The [`Mutex`],
+//! [`RwLock`] and [`Condvar`] below are process-private, non-poisoning and not
+//! reentrant, matching the C library's pthread primitives.
 
 pub use core::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 
-use core::ops::Deref;
-
-/// A value initialized on first use.
-///
-/// This is the single-threaded shape of `std::sync::LazyLock`. The initializer
-/// is an `Fn` (not `FnOnce`), which keeps the implementation entirely safe: no
-/// `UnsafeCell`, no `Option` take, no reentrancy panic. A closure that consumes
-/// its environment by value is `FnOnce`, so it must be rewritten to clone or
-/// move the captured value inside the closure, or the caller can use a
-/// `OnceCell` directly.
-///
-/// # Example
-///
-/// ```ignore
-/// static TABLE: LazyLock<Vec<u8>> = LazyLock::new(|| vec![1, 2, 3]);
-/// assert_eq!(TABLE.len(), 3);
-/// ```
-///
-/// `LazyLock` is `Sync` when `T: Sync`/`F: Sync`; in this SDK that only matters
-/// for placing it in a `static`, because no second thread exists to race with
-/// the initializer.
-pub struct LazyLock<T, F = fn() -> T> {
-    cell: OnceCell<T>,
-    init: F,
-}
-
-impl<T, F> LazyLock<T, F> {
-    /// Create a lazily initialized value.
-    pub const fn new(init: F) -> LazyLock<T, F> {
-        LazyLock {
-            cell: OnceCell::new(),
-            init,
-        }
-    }
-
-    /// The already-initialized value, if initialization has happened.
-    pub fn get(&self) -> Option<&T> {
-        self.cell.get()
-    }
-
-    /// Consume the `LazyLock` and return the initialized value, if any.
-    ///
-    /// This does not run the initializer.
-    pub fn into_inner(self) -> Option<T> {
-        self.cell.into_inner()
-    }
-}
-
-impl<T, F: Fn() -> T> LazyLock<T, F> {
-    /// Force initialization and return a reference to the value.
-    pub fn force(this: &LazyLock<T, F>) -> &T {
-        this.cell.get_or_init(|| (this.init)())
-    }
-}
-
-impl<T, F: Fn() -> T> Deref for LazyLock<T, F> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        LazyLock::force(self)
-    }
-}
-
-impl<T: core::fmt::Debug, F: Fn() -> T> core::fmt::Debug for LazyLock<T, F> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl<T: core::fmt::Display, F: Fn() -> T> core::fmt::Display for LazyLock<T, F> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Display::fmt(&**self, f)
-    }
-}
+pub use crate::lazy::LazyLock;
 
 // ─── futex-backed synchronization (kernel 0.13+) ────────────────────────────
 //
@@ -89,8 +17,13 @@ impl<T: core::fmt::Display, F: Fn() -> T> core::fmt::Display for LazyLock<T, F> 
 // They are process-private (the ABI's private futex flag), non-poisoning and
 // not reentrant, matching the C library's pthread primitives.
 
-use core::ops::DerefMut;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, Ordering};
+use core::time::Duration;
+
+use libpagh::abi::Timespec;
+use libpagh::errno::Errno;
+use libpagh::sys;
 
 use crate::thread::{futex_wait, futex_wake, yield_now};
 
@@ -178,6 +111,183 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         self.mutex.state.store(0, Ordering::Release);
         let _ = futex_wake(&self.mutex.state, u32::MAX);
+    }
+}
+
+/// A condition variable paired with a [`Mutex`].
+///
+/// This is the std shape: [`wait`](Condvar::wait) consumes a [`MutexGuard`],
+/// releases the mutex, blocks, and returns a re-acquired guard;
+/// [`wait_timeout`](Condvar::wait_timeout) adds a deadline and a
+/// [`WaitTimeoutResult`]; [`notify_one`](Condvar::notify_one) and
+/// [`notify_all`](Condvar::notify_all) wake one or every waiter.
+///
+/// # Contract
+///
+/// The condition itself (the predicate a waiter checks) must be protected by
+/// the same mutex the guard belongs to, and a notifier must change that
+/// predicate while holding the mutex. The implementation then has no lost
+/// wakeup in the intended pattern:
+///
+/// ```ignore
+/// let mut guard = mutex.lock();
+/// while !*guard {
+///     guard = condvar.wait(guard);
+/// }
+/// ```
+///
+/// A notification delivered before `wait` can see it is not remembered by the
+/// condition variable, exactly like `std::sync::Condvar`; the predicate is the
+/// state that matters. Notifications not made under the mutex are allowed but
+/// can be observed as a spurious return.
+///
+/// # Deviations from `std::sync::Condvar`
+///
+/// * **No poisoning.** [`Mutex`] is non-poisoning, so these methods cannot
+///   report a poisoned lock.
+/// * **Spurious returns.** A signal-interrupted wait (`EINTR`), a futex table
+///   error (`EAGAIN`/`ENOMEM`), or a wake that races the sequence word makes
+///   `wait` return the guard without a notification. The std pattern already
+///   re-checks the predicate in a loop, which is the required use.
+/// * **Timeout granularity.** The kernel's only timeout is the 10 ms scheduler
+///   tick; a non-zero duration is rounded **up** to it. A zero duration returns
+///   immediately with `timed_out() == true`. There is no realtime-clock futex
+///   (`FUTEX_CLOCK_REALTIME` is rejected by the ABI).
+/// * **Small static futex table.** The kernel tracks at most 32 waiters and 16
+///   distinct futex addresses per boot; exhausting those slots is visible as a
+///   spurious return, never as a deadlock.
+/// * **Process-private.** Like the mutex, the sequence word uses
+///   `FUTEX_PRIVATE_FLAG`; another process cannot wait on or wake it.
+///
+/// The condition variable must outlive its waiters (do not drop it while a
+/// thread is blocked inside [`Condvar::wait`]); this is the same rule as std.
+pub struct Condvar {
+    /// Notification sequence. Waiters block while this word is unchanged.
+    seq: AtomicU32,
+}
+
+impl Condvar {
+    /// Create a condition variable with no waiters.
+    pub const fn new() -> Condvar {
+        Condvar {
+            seq: AtomicU32::new(0),
+        }
+    }
+
+    /// Wait for a notification, releasing `guard` while blocked.
+    ///
+    /// The guard is re-acquired before returning, even if the wait was
+    /// interrupted or the futex reported an error (see the type-level
+    /// deviations). Callers must re-check their predicate in a loop.
+    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        self.wait_inner(guard, None).0
+    }
+
+    /// Wait for a notification or until `timeout` elapses.
+    ///
+    /// Returns the re-acquired guard and a [`WaitTimeoutResult`] that is
+    /// `timed_out()` only when the kernel reported `ETIMEDOUT`. A notification
+    /// that arrives at the deadline wins if the futex was woken; a signal or a
+    /// table error is reported as not-timed-out and must be treated as a
+    /// spurious return. The duration is rounded up to the 10 ms tick.
+    pub fn wait_timeout<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        timeout: Duration,
+    ) -> (MutexGuard<'a, T>, WaitTimeoutResult) {
+        let (guard, timed_out) = self.wait_inner(guard, Some(timeout));
+        (guard, WaitTimeoutResult { timed_out })
+    }
+
+    /// Wake one waiter, if there is one.
+    ///
+    /// The sequence word is advanced even when no thread is waiting; a later
+    /// waiter simply starts from the new value, so there is no stored
+    /// notification (matching std).
+    pub fn notify_one(&self) {
+        self.seq.fetch_add(1, Ordering::Release);
+        let _ = futex_wake(&self.seq, 1);
+    }
+
+    /// Wake every waiter currently blocked on this condition variable.
+    pub fn notify_all(&self) {
+        self.seq.fetch_add(1, Ordering::Release);
+        let _ = futex_wake(&self.seq, u32::MAX);
+    }
+
+    fn wait_inner<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        timeout: Option<Duration>,
+    ) -> (MutexGuard<'a, T>, bool) {
+        // Read the sequence while the caller still holds the mutex. A notifier
+        // that follows the contract needs that mutex to change the predicate,
+        // so it cannot increment the word between this read and the release
+        // below without the waiter either seeing the new value or getting an
+        // immediate `EAGAIN` from the futex's value check.
+        let seq = self.seq.load(Ordering::Acquire);
+        let mutex = guard.mutex;
+        drop(guard);
+
+        let timed_out = matches!(wait_on_word(&self.seq, seq, timeout), Err(Errno::ETIMEDOUT));
+        (mutex.lock(), timed_out)
+    }
+}
+
+/// `FUTEX_WAIT` with the timeout `Timespec` kept alive across the call.
+///
+/// This deliberately does not call `libpagh::thread::futex_wait` for a timed
+/// wait: that helper builds its `Timespec` in a temporary scope and passes a
+/// pointer to the dead local to the syscall, so the kernel reads an arbitrary
+/// stack slot. Keeping the struct in this frame is the fix on the SDK side
+/// (the sibling `pagh-api` crate is a separate checkout and is not patched
+/// here); the kernel validates the values it actually receives.
+fn wait_on_word(
+    word: &AtomicU32,
+    expected: u32,
+    timeout: Option<Duration>,
+) -> libpagh::errno::Result<i32> {
+    let address = word as *const AtomicU32 as usize;
+    let operation = sys::FUTEX_WAIT | sys::FUTEX_PRIVATE_FLAG;
+    match timeout {
+        None => sys::futex(address, operation, expected, 0),
+        Some(duration) => {
+            // The ABI takes a `Timespec`; clamp an absurd duration instead of
+            // wrapping the cast. The kernel rounds up to its next 10 ms tick.
+            let seconds = duration.as_secs().min(i64::MAX as u64) as i64;
+            let timespec = Timespec {
+                seconds,
+                nanos: duration.subsec_nanos() as i64,
+            };
+            sys::futex(
+                address,
+                operation,
+                expected,
+                &timespec as *const Timespec as usize,
+            )
+        }
+    }
+}
+
+impl Default for Condvar {
+    fn default() -> Condvar {
+        Condvar::new()
+    }
+}
+
+/// Whether [`Condvar::wait_timeout`] returned because its deadline elapsed.
+///
+/// This is the same shape as `std::sync::WaitTimeoutResult`, including the
+/// caveat that a spurious return is not reported as a timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitTimeoutResult {
+    timed_out: bool,
+}
+
+impl WaitTimeoutResult {
+    /// True when the wait ended at the requested deadline.
+    pub const fn timed_out(&self) -> bool {
+        self.timed_out
     }
 }
 

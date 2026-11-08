@@ -6,12 +6,13 @@
 //! operate directly on the frozen syscall table:
 //!
 //! * [`File`](crate::fs::File) is one unbuffered `read`/`write`/`lseek` per
-//!   method call;
+//!   method call on the normal path; its direct `BufRead` implementation reads
+//!   ahead into an 8 KiB buffer only when `fill_buf` is used;
 //! * [`BufReader`] and [`BufWriter`] add userland buffering;
 //! * [`stdin`] blocks by retrying `EAGAIN` with `sched_yield`. The kernel's
-//!   console `read(0)` is non-blocking, and there is no `poll` in the ABI, so
-//!   this SDK-level loop is the only way to provide ordinary blocking stdin.
-//!   The console has **no EOF**: `cat` with no arguments waits forever.
+//!   console `read(0)` is non-blocking; this handle keeps its historical yield
+//!   loop (the `poll` wrapper is available separately). The console has **no
+//!   EOF**: `cat` with no arguments waits forever.
 //!
 //! There is no `Cursor`, `Chain`, `Tee`, file locking or vectored I/O in this
 //! version; every one of those would be a userland-only convenience, and the
@@ -461,6 +462,98 @@ impl<B: BufRead> Iterator for Split<B> {
 }
 
 // ---------------------------------------------------------------------------
+// Internal read-ahead buffer
+// ---------------------------------------------------------------------------
+
+/// Read-ahead storage used by [`BufRead`] implementations on concrete types.
+///
+/// `std` implements `BufRead` for `BufReader`, not for `File` or `TcpStream`.
+/// pagh_std implements the trait directly on those types (see their module
+/// docs); this is the small buffer behind that choice. It is allocated lazily,
+/// only when `fill_buf` is first called, so programs that use the unbuffered
+/// `Read` path do not pay for it.
+pub(crate) struct ReadBuffer {
+    buf: Vec<u8>,
+    pos: usize,
+    cap: usize,
+}
+
+impl ReadBuffer {
+    pub(crate) const fn new() -> ReadBuffer {
+        ReadBuffer {
+            buf: Vec::new(),
+            pos: 0,
+            cap: 0,
+        }
+    }
+
+    /// Bytes buffered but not consumed.
+    pub(crate) fn unread(&self) -> usize {
+        self.cap - self.pos
+    }
+
+    /// The buffered bytes, without reading further.
+    pub(crate) fn buffered(&self) -> &[u8] {
+        &self.buf[self.pos..self.cap]
+    }
+
+    /// Drop all buffered bytes (the underlying object handles any repositioning).
+    pub(crate) fn discard(&mut self) {
+        self.pos = 0;
+        self.cap = 0;
+    }
+
+    /// Mark `amt` buffered bytes consumed, clamped to what is present.
+    pub(crate) fn consume(&mut self, amt: usize) {
+        self.pos += core::cmp::min(amt, self.unread());
+    }
+
+    /// `Read` through the buffer.
+    ///
+    /// An empty buffer makes this a direct call; otherwise the request is
+    /// served from the current buffered slice. `read_raw` is only invoked when
+    /// no read-ahead bytes are pending.
+    pub(crate) fn read<F>(&mut self, out: &mut [u8], read_raw: F) -> Result<usize>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize>,
+    {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.pos < self.cap {
+            let n = core::cmp::min(out.len(), self.unread());
+            out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        read_raw(out)
+    }
+
+    /// Refill if empty and return the readable window.
+    pub(crate) fn fill<F>(&mut self, read_raw: F) -> Result<&[u8]>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize>,
+    {
+        if self.pos >= self.cap {
+            self.pos = 0;
+            self.cap = 0;
+            if self.buf.is_empty() {
+                self.buf = vec![0u8; DEFAULT_BUFFER_SIZE];
+            }
+            let n = read_raw(&mut self.buf)?;
+            if n > self.buf.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "reader returned more bytes than the buffer holds",
+                ));
+            }
+            self.cap = n;
+        }
+        Ok(&self.buf[self.pos..self.cap])
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Buffered adapters
 // ---------------------------------------------------------------------------
 
@@ -732,8 +825,8 @@ impl Read for Stdin {
             match sys::read(0, buf) {
                 Ok(n) => return Ok(n),
                 Err(Errno::EAGAIN) => {
-                    // No poll syscall exists in this ABI. Yielding is the
-                    // documented way for a console reader to wait.
+                    // Keep the console reader's historical yield loop; the
+                    // `poll` wrapper is available for callers that want it.
                     let _ = sys::sched_yield();
                 }
                 Err(error) => return Err(error.into()),

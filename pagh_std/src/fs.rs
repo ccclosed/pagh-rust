@@ -28,7 +28,7 @@ use libpagh::errno::Errno;
 use libpagh::sys;
 
 use crate::error::{Error, ErrorKind, Result};
-use crate::io::{self, Read, Seek, SeekFrom, Write};
+use crate::io::{self, BufRead, Read, ReadBuffer, Seek, SeekFrom, Write};
 use crate::path::{Path, PathBuf};
 
 /// Resolve `path` to the absolute, lexically-normalized form the kernel needs.
@@ -307,7 +307,10 @@ impl OpenOptions {
         }
         let absolute = resolve_path(path.as_ref());
         let fd = sys::openat(sys::AT_FDCWD, &absolute, flags, self.mode)?;
-        Ok(File { fd })
+        Ok(File {
+            fd,
+            read_ahead: ReadBuffer::new(),
+        })
     }
 }
 
@@ -318,9 +321,32 @@ impl Default for OpenOptions {
 }
 
 /// An open file descriptor, closed on drop.
-#[derive(Debug)]
+///
+/// `File` keeps its `std`-shaped inherent API and also implements
+/// [`Read`]/[`Write`]/[`Seek`] (as `std::fs::File` does) plus [`BufRead`].
+/// The `BufRead` implementation is a pagh extension: `std::fs::File` does not
+/// implement `BufRead`, because a plain file is unbuffered. Here `fill_buf`
+/// reads ahead into an internal 8 KiB buffer; `Read` drains that buffer before
+/// touching the descriptor, `Seek` accounts for the unread bytes, and `Write`
+/// rewinds over them first so the logical file position stays consistent.
+/// Programs that want explicit control over buffering should keep using
+/// [`io::BufReader`] (the `wc` example does).
+///
+/// The read-ahead buffer is allocated lazily and is empty for a file that only
+/// uses `read`/`write`/`seek`; `File` remains otherwise unbuffered.
+/// `as_raw_fd` exposes the kernel offset, which is ahead of the logical
+/// position while read-ahead is pending; `into_raw_fd` rewinds that read-ahead
+/// (best effort) before handing the descriptor over. Use `BufReader` when the
+/// distinction matters.
 pub struct File {
     fd: i32,
+    read_ahead: ReadBuffer,
+}
+
+impl core::fmt::Debug for File {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("File").field("fd", &self.fd).finish()
+    }
 }
 
 impl File {
@@ -351,15 +377,36 @@ impl File {
     }
 
     /// The raw descriptor, for the few APIs that take one directly.
+    ///
+    /// If `BufRead` has read ahead, the descriptor's offset is ahead of this
+    /// `File`'s logical position; see the type-level note.
     pub fn as_raw_fd(&self) -> i32 {
         self.fd
     }
 
     /// Give up ownership of the descriptor; the caller must close it.
+    ///
+    /// Any pending read-ahead is rewound first (best effort), so the raw
+    /// descriptor starts at the logical position this `File` reports.
     pub fn into_raw_fd(mut self) -> i32 {
         let fd = self.fd;
+        let unread = self.read_ahead.unread();
+        if unread > 0 {
+            let _ = sys::lseek(fd, -(unread as i64), sys::SEEK_CUR);
+        }
+        self.read_ahead.discard();
         self.fd = -1;
         fd
+    }
+
+    /// Drop read-ahead and move the descriptor back to the logical position.
+    fn discard_read_ahead(&mut self) -> Result<()> {
+        let unread = self.read_ahead.unread();
+        if unread > 0 {
+            sys::lseek(self.fd, -(unread as i64), sys::SEEK_CUR)?;
+        }
+        self.read_ahead.discard();
+        Ok(())
     }
 
     /// Take ownership of an existing descriptor.
@@ -371,9 +418,12 @@ impl File {
     pub unsafe fn from_raw_fd(fd: i32) -> File {
         // SAFETY: constructing `File` performs no operation on the descriptor;
         // the caller's guarantee is what makes the eventual `Drop` and I/O
-        // sound. The struct is a plain `i32` wrapper, so this body contains no
-        // unsafe operation of its own.
-        File { fd }
+        // sound. The struct is a plain descriptor plus an empty buffer, so this
+        // body contains no unsafe operation of its own.
+        File {
+            fd,
+            read_ahead: ReadBuffer::new(),
+        }
     }
 
     /// Metadata for the open file (`fstat`).
@@ -426,12 +476,19 @@ impl Drop for File {
 
 impl Read for File {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        sys::read(self.fd, buf).map_err(Error::from)
+        let fd = self.fd;
+        self.read_ahead
+            .read(buf, |out| sys::read(fd, out).map_err(Error::from))
     }
 }
 
 impl Write for File {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        // If `BufRead::fill_buf` read ahead, the kernel offset is beyond this
+        // File's logical position. Move it back before writing, so a
+        // read-then-write sequence behaves like an unbuffered File. O_APPEND
+        // ignores the offset and appends regardless, which is still correct.
+        self.discard_read_ahead()?;
         sys::write(self.fd, buf).map_err(Error::from)
     }
 
@@ -440,18 +497,39 @@ impl Write for File {
     }
 }
 
+impl BufRead for File {
+    fn fill_buf(&mut self) -> Result<&[u8]> {
+        let fd = self.fd;
+        self.read_ahead
+            .fill(|out| sys::read(fd, out).map_err(Error::from))
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.read_ahead.consume(amt);
+    }
+}
+
 impl Seek for File {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        let unread = self.read_ahead.unread() as i64;
         let (offset, whence) = match pos {
             SeekFrom::Start(value) => {
                 let offset =
                     i64::try_from(value).map_err(|_| Error::from(libpagh::errno::Errno::EINVAL))?;
                 (offset, sys::SEEK_SET)
             }
-            SeekFrom::Current(delta) => (delta, sys::SEEK_CUR),
+            // The descriptor is `unread` bytes ahead of the logical position.
+            SeekFrom::Current(delta) => {
+                let adjusted = delta
+                    .checked_sub(unread)
+                    .ok_or(Error::from(libpagh::errno::Errno::EINVAL))?;
+                (adjusted, sys::SEEK_CUR)
+            }
             SeekFrom::End(delta) => (delta, sys::SEEK_END),
         };
-        sys::lseek(self.fd, offset, whence).map_err(Error::from)
+        let result = sys::lseek(self.fd, offset, whence)?;
+        self.read_ahead.discard();
+        Ok(result)
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "pagh_std"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 publish = false
 description = "A std-like Rust layer over the pagh-riscv native ABI (libpagh)"
@@ -15,9 +15,8 @@ path = "src/lib.rs"
 # `pagh-api`; see the workspace README for `PAGH_API` and the sibling layout.
 libpagh = { path = "../../pagh-api/libpagh" }
 
-# The three real programs live at the repository root (`examples/`) so the SDK
-# and its examples read like one project, not like test fixtures hidden inside
-# the crate.
+# The real programs live at the repository root (`examples/`) so the SDK and its
+# examples read like one project, not like test fixtures hidden inside the crate.
 [[example]]
 name = "cat"
 path = "../examples/cat.rs"
@@ -36,3 +35,11 @@ path = "../examples/threads_mutex.rs"
 [[example]]
 name = "spawn"
 path = "../examples/spawn.rs"
+
+[[example]]
+name = "condvar"
+path = "../examples/condvar.rs"
+
+[[example]]
+name = "io_traits"
+path = "../examples/io_traits.rs"

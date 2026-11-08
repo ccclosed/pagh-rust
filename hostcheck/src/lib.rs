@@ -1,9 +1,10 @@
 //! Host-only tests for the pure logic in `pagh_std`.
 //!
 //! `pagh_std` itself cannot be compiled for the host: `libpagh` is a bare-metal
-//! RISC-V crate whose syscall module contains `ecall` assembly. The path and
-//! formatting logic, however, uses only `core` + `alloc`, so this crate includes
-//! the source file directly and tests it with the host toolchain:
+//! RISC-V crate whose syscall module contains `ecall` assembly. The path,
+//! formatting and single-threaded `LazyLock` logic, however, uses only `core` +
+//! `alloc`, so this crate includes those source files directly and tests them
+//! with the host toolchain:
 //!
 //! ```sh
 //! cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu
@@ -25,14 +26,18 @@ mod path;
 // These modules are also pure `core` + `alloc`; including them here means the
 // host test gate covers the collection shims, the deterministic hasher and the
 // single-threaded LazyLock without compiling libpagh's RISC-V syscalls.
+//
+// LazyLock lives in `pagh_std/src/lazy.rs` rather than `sync.rs` precisely so
+// this gate can include it: `sync.rs` now also owns the futex-backed Mutex,
+// RwLock and Condvar, which import `libpagh` and cannot be built for the host.
 #[path = "../../pagh_std/src/hash.rs"]
 mod hash;
 #[path = "../../pagh_std/src/collections/hash_map.rs"]
 mod hash_map;
 #[path = "../../pagh_std/src/collections/hash_set.rs"]
 mod hash_set;
-#[path = "../../pagh_std/src/sync.rs"]
-mod sync;
+#[path = "../../pagh_std/src/lazy.rs"]
+mod lazy;
 
 #[cfg(test)]
 mod tests {
@@ -174,8 +179,9 @@ mod tests {
 
     #[test]
     fn lazy_lock_initializes_once_and_cells_work() {
-        use super::sync::{Cell, LazyLock, OnceCell, RefCell};
+        use super::lazy::LazyLock;
         use alloc::string::String;
+        use core::cell::{Cell, OnceCell, RefCell};
 
         let lazy = LazyLock::new(|| String::from("initialized"));
         assert_eq!(&*lazy, "initialized");

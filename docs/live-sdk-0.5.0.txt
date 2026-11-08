@@ -1,0 +1,69 @@
+pagh-rust — live SDK verification for 0.5.0
+===========================================
+date (UTC):        2026-11-08T20:42:59Z
+crate:             pagh_std 0.5.0
+source state:      the working tree committed as tag v0.5.0
+toolchain:         nightly-2026-07-12 (rustc 1.99.0-nightly (be8e82435 2026-07-11))
+target:            riscv64gc-unknown-none-elf
+kernel package:    pagh-riscv 0.16.2 (Cargo.toml; kernel tree was not modified)
+kernel, run A:     /home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh
+                   sha256 4908667954266ed0d80c3d5109a7e7dd07c259a5b724e9e4cc6bfd24bffc10ad
+kernel, run B:     /home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/release/pagh
+                   sha256 1301d73c6b3b9ed881891aa4f8ba58e918f614b4e5fdb0da6de9fb232c0d2421
+qemu:              QEMU emulator version 10.2.2 (qemu-10.2.2-1.fc44)
+image:             64 MiB ext2, `truncate -s 64M` + `mke2fs -q -t ext2 -F -b 4096 -d <rootfs>`
+                   staging root contained only the release ELFs condvar and io_traits
+build:             ./build.sh --release (release profile, strip debuginfo)
+release ELFs:      condvar   sha256 5ca087e19b8e0b34ea4f0c37789288b71c24cea85a1ebdb1aca99de89a02b2aa
+                   io_traits sha256 2ba67598fbca46ab5a38a4592764ec2acf5783ddd00bfec423921c5261390e4f
+checks:            CONDVAR PASS and IO_TRAITS PASS (file run); IO_TRAITS PASS (TCP run)
+
+Run A is the exact requested invocation from the `pagh-riscv` checkout:
+
+    python3 tools/run.py --disk /tmp/pagh-rust-0.5.img \
+      --keys 'run /mnt/condvar\nrun /mnt/io_traits\nhalt\n' \
+      --settle 40 --serial-log /tmp/pagh-rust-0.5.log
+
+Run A used the default debug kernel. `--keys` contains `halt`, so QEMU powers
+off before run.py's post-settle screendump; run.py therefore prints "cannot
+connect to the QEMU monitor" after saving the serial log. The log below is the
+complete shell transcript and contains both `exited with code 0` lines.
+
+Run B uses the release kernel plus `--net` and a host TCP server. The guest
+reaches the host loopback as 10.0.2.2; the server accepted one connection, read
+the request, sent `PAGH-IO-TRAITS\nsecond line\n`, and closed.
+
+The transcripts below are from the shell prompt; the OpenSBI/kernel boot banner
+is omitted (the kernels hashed above booted normally). CRLF is normalized to LF.
+
+===== run A serial transcript (default debug kernel) =====
+
+pagh:rv64> run /mnt/condvar
+condvar: phase 1: all 4 waiters blocked and released the mutex
+condvar: phase 1: notify_all woke every waiter
+condvar: phase 1: scoped join returned each thread's value
+condvar: phase 2: 3 waiters ready
+condvar: phase 2: notify_one woke exactly 1 of 3
+condvar: phase 2: notify_all woke the remaining waiters
+condvar: wait_timeout returned timed_out after 50ms
+condvar: wait_timeout respected the ~50 ms deadline
+condvar: wait_timeout returned the guard re-locked
+condvar: thread::scope let 4 threads borrow &mut stack slots
+CONDVAR PASS
+run: /mnt/condvar exited with code 0
+pagh:rv64> run /mnt/io_traits
+io_traits: File Write/Read/Seek/BufRead ok (/mnt/io_traits.txt)
+IO_TRAITS PASS
+run: /mnt/io_traits exited with code 0
+pagh:rv64> halt
+halt: powering off
+
+===== run B serial transcript (release kernel, virtio-net, host server:18080) =====
+
+pagh:rv64> run /mnt/io_traits net 10.0.2.2 18080
+io_traits: File Write/Read/Seek/BufRead ok (/mnt/io_traits.txt)
+io_traits: TcpStream Write/BufRead/Read ok (10.0.2.2:18080)
+IO_TRAITS PASS
+run: /mnt/io_traits exited with code 0
+pagh:rv64> halt
+halt: powering off
