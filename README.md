@@ -23,20 +23,38 @@ What *is* fully real is **Rust the language** plus the `alloc` crate:
   and the ABI's IPv4 sockets: a TCP client, a TCP listener and UDP datagrams;
 - a **DNS stub resolver** (`pagh_std::net::dns`, RFC 1035 over a `UdpSocket`)
   and `connect("host:port")`, because the ABI has no resolver call;
-- **TLS 1.3** (`pagh_std::tls`, vendored `embedded-tls` 0.19.0) with fail-closed
-  server authentication: chain to a committed CA bundle, SAN hostname check, a
-  clock gate and `CertificateVerify`. The ABI has **no entropy source and no
-  wall clock**, so the caller supplies both; nothing is invented in their
-  place.
+- **TLS 1.3** (`pagh_std::tls`) through the **kernel's own** fail-closed client
+  (pagh-riscv 0.21.0: `tls_connect` 1100 / `tls_write` 1101 / `tls_read` 1102 /
+  `tls_close` 1103, plus `getrandom` 278): the certificate chain must reach the
+  kernel's committed CA bundle, the SAN must authorize the name, the RTC clock
+  gate must pass and `CertificateVerify` must check out. `TlsStream` gives
+  `connect("host:port")`, read/write/close, and `https_get` is one call. The
+  program supplies **no clock and no entropy** — the kernel has both. The 0.7.0
+  userland implementation (vendored `embedded-tls`) stays behind the
+  off-by-default `vendored-tls` feature.
 
 `pagh_std` does **not** claim to be `std`, does not provide dynamic linking or
 `OsStr`, and returns a typed `io::ErrorKind::Unsupported` for operations the
 ABI cannot express. Those are listed under
 [Limitations vs std](#limitations-vs-std).
 
-**Live evidence:** [`docs/live-sdk-0.7.0.txt`](docs/live-sdk-0.7.0.txt) is the
-QEMU serial transcript for this release — one boot that runs the whole 0.7.0
-matrix, **55/55 checks passed** against `pagh-riscv 0.19.0` / QEMU 10.2.2:
+**Live evidence:** [`docs/live-sdk-0.8.0.txt`](docs/live-sdk-0.8.0.txt) is the
+QEMU serial transcript for this release — one boot against `pagh-riscv 0.21.0`
+that runs the kernel-backed TLS matrix, **32/32 checks passed**: `tls_get`
+fetches `https://example.com/` with **no clock argument and no seed argument**
+and prints `status 200 body 577 bytes`, while the kernel prints its own
+evidence (`tls: verified leaf=sha256:85ca6ab0… chain=4 certs anchors=6
+host=example.com`, `tls: CertificateVerify OK`, `tls: user session 0 open
+host=example.com`); `--manual` drives `TlsStream` (connect, write, read one
+response, `close`); the vendored 0.7.0 program still fetches the same page
+seeded from `getrandom`; and two refusals hold the line — a self-signed chain
+(`tls: verify FAILED cause=chain`) and a trusted chain pinned under the wrong
+name (`cause=hostname`), both `EKEYREJECTED` (errno 129) in userland.
+
+The 0.7.0 transcript remains the evidence for that release
+([`docs/live-sdk-0.7.0.txt`](docs/live-sdk-0.7.0.txt), **55/55 checks** against
+`pagh-riscv 0.19.0` / QEMU 10.2.2, still reproducible by
+`tools/live_070.py` on 0.21.0):
 `HASH_MAP PASS` (a `Hash + Eq` key with no `Ord`, 1000 keys → `capacity 1536`,
 500 removals, 64 keys in one bucket), `DNS PASS` (a real `A` query answered by
 the DHCP-leased server the script read out of the kernel's own boot log,
@@ -61,7 +79,8 @@ mpsc, barrier, `Once` and the `TcpStream` client),
 ```
 Cargo.toml                 workspace: pagh_std, hostcheck, diagnostic probes
 vendor/                    byte-pinned crates (embedded-tls + the verify-only
-                           crypto backends), wired through .cargo/config.toml
+                           crypto backends), wired through .cargo/config.toml;
+                           compiled only with the `vendored-tls` feature
 rust-toolchain.toml        pinned nightly-2026-07-12 + riscv64gc target
 .cargo/config.toml         target + pagh-user.ld + rust-lld (sibling layout)
 build.sh                   builds the example ELFs (honours PAGH_API)
@@ -86,22 +105,28 @@ pagh_std/src/
                            socket options, connect(host:port)
   net/dns.rs               the stub resolver (RFC 1035 over a UdpSocket)
   net/dns_wire.rs          the pure query/response codec (host-tested)
-  tls/mod.rs               TLS 1.3 docs + the fail-closed contract
-  tls/stream.rs            TlsStream/Entropy/https_get over embedded-tls
-  tls/{x509,tls_verify,tls_chain,tls_auth,hostname,http,ca_bundle}.rs
-                           the ported pure verifier + the committed CA bundle
+  tls/mod.rs               TLS 1.3 docs + the fail-closed contract (the kernel's)
+  tls/stream.rs            TlsStream (connect/read/write/close) + https_get
+  tls/url.rs               the pure https://host[:port][/path] parser
+  tls/http.rs              the pure HTTP/1.1 request/response codec
+  tls/vendored/            the 0.7.0 userland stack: stream.rs (embedded-tls),
+                           Entropy, and the ported verifier + CA bundle
+                           ({x509,tls_verify,tls_chain,tls_auth,hostname})
   fmt.rs                   core::fmt re-exports
   panic.rs                 PanicInfo/abort + the runtime contract
   ffi.rs                   c_* types, CStr/CString
 examples/                  cat, wc, find, threads_mutex, spawn, condvar, io_traits,
                            tcp_server, udp_echo, sync_primitives, hash_map, dns,
-                           socket_opts, tls_get
+                           socket_opts, tls_get, tls_get_vendored (feature-gated)
 hostcheck/                 host cargo test for the pure modules (path, hash,
-                           collections, lazy, dns_wire, tls hostname/http)
+                           collections, lazy, dns_wire, tls url/http/hostname)
 tools/probes/              panic/oom/chdir/fsops/clock diagnostic programs
 tools/live_check.py        builds, boots QEMU, runs the 0.4.0 filesystem matrix
 tools/live_070.py          the 0.7.0 live matrix: hash map, DNS, socket
-                           options, TLS 1.3 (one boot, one transcript)
+                           options, the vendored TLS 1.3 client (one boot)
+tools/live_080.py          the 0.8.0 live matrix: the kernel-backed TLS
+                           client, its two refusals, and the vendored path
+                           seeded from getrandom (one boot, one transcript)
 tools/live_net.py          the 0.6.0 network/sync live matrix (one boot, one
                            command at a time, host peers, docs/ transcript)
 .github/workflows/ci.yml   fmt + RISC-V build + host tests
@@ -109,7 +134,8 @@ docs/live-rust-sdk.txt     the 0.4.0 captured live run
 docs/live-sdk-0.5.0.txt    the 0.5.0 condvar/io-traits captured runs
 docs/live-sdk-0.6.0.txt    the 0.6.0 network/sync captured run (47/47)
 docs/live-sdk-0.7.0.txt    the 0.7.0 captured run (55/55: hash map, DNS,
-                           socket options, TLS 1.3)
+                           socket options, vendored TLS 1.3)
+docs/live-sdk-0.8.0.txt    the 0.8.0 captured run (32/32: kernel-backed TLS)
 ```
 
 ## A program
@@ -167,25 +193,28 @@ relative path in `.cargo/config.toml` and therefore needs the sibling layout.
 ./build.sh                  # dev profile: opt-level 2, strip debuginfo, checks on
 ./build.sh --release        # release profile
 ./build.sh --fixtures       # also build panic/oom/chdir/fsops/clock probes
+./build.sh --vendored       # also build tls_get_vendored (needs the TLS stack)
 ```
 
 Outputs (the kernel refuses images above 1 MiB — `run_file_with_argv0` checks
 the size before mapping anything):
 
 ```text
-target/riscv64gc-unknown-none-elf/debug/examples/cat … sync_primitives   (~170–260 KiB)
-target/riscv64gc-unknown-none-elf/debug/examples/hash_map                210 KiB
-target/riscv64gc-unknown-none-elf/debug/examples/dns                     316 KiB
-target/riscv64gc-unknown-none-elf/debug/examples/socket_opts             278 KiB
-target/riscv64gc-unknown-none-elf/release/examples/tls_get               772 KiB
+target/riscv64gc-unknown-none-elf/debug/examples/cat … sync_primitives   (~178–300 KiB)
+target/riscv64gc-unknown-none-elf/debug/examples/hash_map                194 KiB
+target/riscv64gc-unknown-none-elf/debug/examples/dns                     301 KiB
+target/riscv64gc-unknown-none-elf/debug/examples/socket_opts             261 KiB
+target/riscv64gc-unknown-none-elf/debug/examples/tls_get                 284 KiB
+target/riscv64gc-unknown-none-elf/release/examples/tls_get_vendored      760 KiB
 ```
 
-**`tls_get` is release-only.** The TLS example links `embedded-tls` and the
-verify-only crypto backends (RSA, P-256/P-384, Ed25519) whose *debug* build is
-1.19 MiB — over the kernel's limit; `./build.sh --release` brings it to 772 KiB
-and that is the profile the live matrix runs. `tools/live_070.py` always builds
-release for exactly this reason, and CI gates the release size of all four
-0.7.0 examples.
+**Only the vendored TLS example is release-only.** 0.8.0's `tls_get` links no
+TLS stack at all — the handshake is the kernel's — so its debug image is
+284 KiB and CI gates it with every other default example.
+`tls_get_vendored` links the vendored `embedded-tls` and the verify-only crypto
+backends (RSA, P-256/P-384, Ed25519), whose *debug* build is 1.19 MiB — over
+the kernel's limit — and 760 KiB in release, which is the profile
+`tools/live_070.py` uses. The two paths are sized in one CI step.
 
 Equivalent Cargo invocation:
 
@@ -204,16 +233,17 @@ dynamic section.
 The pure path logic can be compiled for the host; `libpagh` itself cannot
 (RISC-V `ecall` assembly). `hostcheck` includes the pure sources directly —
 `path.rs`, `hash.rs`, `collections/{hash_map,hash_set}.rs`, `lazy.rs`,
-`net/dns_wire.rs`, `tls/{hostname,http}.rs` — 34 checks:
+`net/dns_wire.rs`, `tls/{url,http}.rs` and the vendored `tls/vendored/hostname.rs`
+— 37 checks:
 
 ```sh
 cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu
 ```
 
 CI runs that plus `cargo fmt -p pagh_std -p pagh_hostcheck -p pagh_probes --
---check`, `./build.sh --fixtures`, a 1 MiB size check for the ten original
-debug examples, and a release size check for the four 0.7.0 ones
-(`tls_get` is release-only: its debug build is over the limit). (The package-scoped
+--check`, `./build.sh --fixtures`, a 1 MiB size check for all fourteen debug
+examples, and `./build.sh --release --vendored` with a size check for
+`tls_get_vendored` (release-only: its debug build is over the limit). (The package-scoped
 form is deliberate: `cargo fmt --all` also formats local path dependencies, and
 the sibling `pagh-api` checkout must not be modified.) It checks out `pagh-rust` and `pagh-api` as siblings.
 
@@ -257,12 +287,16 @@ run /mnt/dns
 run /mnt/dns --connect=example.com:80    # with --net: resolve + HTTP GET
 run /mnt/dns --server=10.0.2.2 --port=45690 --deadline-ms=1000   # silent server
 run /mnt/socket_opts --peer=10.0.2.2:45683                       # with --net: host echo
-run /mnt/tls_get https://example.com/ 1794234113 @/mnt/seed      # release build
+run /mnt/tls_get                        # https://example.com/, kernel TLS
+run /mnt/tls_get https://example.com/ --manual
+run /mnt/tls_get https://example.com:8443/ --ip=10.0.2.2   # pin the address
+run /mnt/tls_get_vendored https://example.com/ 1794234113 kernel  # --vendored build
 ```
 
-`tls_get` takes the wall clock and a seed from the caller (see
-[`pagh_std::tls`](#pagh_stdtls)); `@/mnt/seed` reads 64 hex characters from a
-file, which keeps the command inside the shell's 128-byte input line.
+`tls_get` needs neither a clock nor a seed: the kernel does the handshake (see
+[`pagh_std::tls`](#pagh_stdtls)). The vendored program is the one that still
+needs the caller's clock (`<unix-seconds>`); `kernel` is its new entropy option,
+which fills the seed from `getrandom(278)` instead of a staged file.
 
 The shell has no quoting or redirection, so an argument cannot contain a
 space, and there is no `cat < file`. Relative arguments are resolved against
@@ -333,7 +367,22 @@ python3 tools/live_070.py --skip-build --keep-work
 | `hash_map` | a key type with `Hash + Eq` and **no `Ord`**, real spare `capacity()` (1000 keys → 1536 buckets), 500 removals with the other 500 still reachable, 64 keys forced into one bucket and a middle deletion that keeps the run reachable (backward shift, no tombstones), `entry`/`retain`/`extend`/`FromIterator`, `Index`, and `HashSet` set algebra |
 | `dns` | a real `A` query answered by the **DHCP-leased** server (the script reads `dns 10.0.2.3` out of the kernel's own boot log and stages exactly that value in `/etc/resolv.conf`, so lease → configuration → query is one chain), the server's TTLs, `NXDOMAIN`, an unencodable name refused before any datagram, a deadline against a host socket that never answers, and `connect("example.com:80")` doing a real HTTP GET |
 | `socket_opts` | `getsockopt(SO_TYPE)` for a stream and a datagram socket, `SO_REUSEADDR` accepted **and** shown not to change a second `bind` (the kernel validates and ignores it), a non-blocking read measured at `WouldBlock`, a 500 ms read deadline enforced by the SDK (the kernel's `SO_RCVTIMEO` reads back zero), `try_clone` sharing one descriptor with the echo read back through the clone, and the UDP receive deadline |
-| `tls_get` | a live HTTPS GET of `example.com` — TLS 1.3 handshake, chain to the committed CA bundle (`anchors=6`), SAN check, clock gate, `CertificateVerify`, 577-byte body — plus four refusals: no clock (`stage=clock`), no entropy (`stage=entropy`), a self-signed chain (`cause=chain`) and a trusted chain for the wrong name (`cause=hostname`) |
+| `tls_get_vendored` | a live HTTPS GET of `example.com` through the **0.7.0 userland** client — TLS 1.3 handshake, chain to the committed CA bundle (`anchors=6`), SAN check, clock gate, `CertificateVerify`, 577-byte body — plus four refusals: no clock (`stage=clock`), no entropy (`stage=entropy`), a self-signed chain (`cause=chain`) and a trusted chain for the wrong name (`cause=hostname`) |
+
+For 0.8.0 the live check is `tools/live_080.py`, the kernel-backed TLS matrix in
+one boot:
+
+```sh
+python3 tools/live_080.py                     # builds, boots, drives, writes docs/
+python3 tools/live_080.py --skip-build --keep-work
+```
+
+| program | what the boot proves |
+|---|---|
+| `tls_get` (default) | `https://example.com/` end to end with **no clock and no seed on the command line**: the SDK resolver, the TCP connect, then the kernel's fail-closed handshake — `tls: verified leaf=sha256:85ca6ab0… chain=4 certs anchors=6 host=example.com`, `tls: CertificateVerify OK`, `tls: user session 0 open host=example.com (TLS 1.3, AES-128-GCM-SHA256, server authenticated, 110 ms)`, `200` and a 577-byte body |
+| `tls_get --manual` | the same fetch through `TlsStream` spelled out: `connect`, `write_all`, `read_http_response`, `close` |
+| `tls_get_vendored … kernel` | the 0.7.0 userland stack still works on the new ABI and takes its seed from `getrandom(278)`; it still needs the caller's clock, which is exactly the difference the two programs make visible |
+| refusals | a self-signed `example.com` on the host (`cause=chain`) and a trusted Google chain pinned under the name `example.com` (`cause=hostname`) are both refused with `EKEYREJECTED`/errno 129, so "the kernel verifies" is not an assertion but a rejection that was observed |
 
 ## API surface
 
@@ -414,8 +463,11 @@ execve `envp` array.
 the 10 ms tick).
 
 `Instant` and `SystemTime` read `clock_gettime(1)` and `clock_gettime(0)`
-respectively. Both are tick counters since boot; there is no RTC, so
-`SystemTime` is **not** a Unix timestamp and `UNIX_EPOCH` is the boot instant.
+respectively. Both are tick counters since boot: the kernel's syscall layer maps
+both clock ids to `timer::uptime_ms()`, and it exposes no wall-clock read even
+though the machine has a goldfish RTC (the kernel uses it for TLS validity
+windows). `SystemTime` is therefore **not** a Unix timestamp and `UNIX_EPOCH`
+is the boot instant.
 Arithmetic saturates rather than panicking; `checked_*` methods are available.
 `Instant::now()`/`SystemTime::now()` fall back to zero if the syscall fails;
 `try_now()` surfaces the error.
@@ -456,8 +508,9 @@ finalizer before the low bits are used as a bucket index, so a `Hasher` only
 has to be consistent, not well distributed.
 
 `hash` re-exports `Hash`/`Hasher`/`BuildHasher` and provides a deterministic
-FNV-1a `RandomState`/`DefaultHasher` (the default `HashMap` hasher) — pagh has
-no entropy source, so “randomly seeded” would be a lie, and a map keyed by
+FNV-1a `RandomState`/`DefaultHasher` (the default `HashMap` hasher) — this
+hasher never claims to be randomly seeded (it would need `getrandom` per map),
+and a map keyed by
 attacker-controlled strings is **not** hash-flooding resistant. The honest
 statement is the documented one: pass a different `BuildHasher` if the keys are
 hostile.
@@ -587,8 +640,8 @@ question), `CNAME` following (four hops), and typed errors (`NameError`,
 (BSD convention), or the compiled-in `10.0.2.3` — QEMU's user-network DNS and
 the DHCP option 6 value on the network the live runs use. There is no IPv6, no
 `AAAA`/`MX`/`TXT`, no TCP fallback for a truncated answer, and no cache. The
-transaction id varies but is **not** unpredictable (no entropy source), which
-is stated rather than implied.
+transaction id varies but is **not** unpredictable (a clock-seeded counter; the
+resolver does not call `getrandom`), which is stated rather than implied.
 
 The kernel's limits apply: one active-open TCP client at a time (accepted
 server connections and the listener have their own descriptors), one listener
@@ -599,40 +652,66 @@ half-close in this layer.
 
 ### `pagh_std::tls`
 
-TLS 1.3 over a `TcpStream`, built on the **vendored** `embedded-tls` 0.19.0
-(the same crate and the same deliberate local patch the kernel links: upstream
-reached `ApplicationData` even when the server never sent `Certificate`, so the
-vendored state machine refuses `Finished` unless the certificate was received
-*and* verified).
+TLS 1.3 over a `TcpStream`, built on the **kernel's** client: pagh-riscv 0.21.0
+owns the handshake, the key schedule, the record layer and a fail-closed
+verifier, and exposes them as four pagh-native syscalls (`docs/abi.md` §2 in
+`pagh-api`):
+
+| nr | call | what it does |
+|---|---|---|
+| 1100 | `tls_connect` | handshake on a **connected** stream socket; the descriptor becomes the session, with `flags` fixed at 0 — there is no "insecure" bit to set |
+| 1101 | `tls_write` | encrypt application data |
+| 1102 | `tls_read` | decrypt application data; `0` is the peer's `close_notify` |
+| 1103 | `tls_close` | send `close_notify`, release the session, close the descriptor |
 
 | Item | Notes |
 |---|---|
-| `TlsStream` | `connect(stream, server_name, now_unix, &mut Entropy)`, `read`, `write`, `write_all`, `flush`, `peer_addr`, `server_name`, `verified`, `record_buffers`; `Read`/`Write` |
-| `Entropy` | a ChaCha20 CSPRNG over a caller-supplied 32-byte seed (`from_seed`, `from_hex`) |
-| `https_get` / `https_get_at` | one authenticated `GET`, returning the decoded body (`Content-Length` or chunked) |
-| `Verified` | what the handshake proved: leaf SHA-256 fingerprint, chain length, anchor count, the clock used |
+| `TlsStream` | `connect("host:port")` (SDK resolver + TCP + handshake) or `connect_stream(socket, host)`; `read`, `write`, `write_all`, `flush`, `read_http_response`, `close`, `peer_addr`, `host`, `fd`; `Read`/`Write`; `Drop` closes without the alert |
+| `https_get` / `https_get_at` | one `GET`, returning an `HttpResponse` with `status()`, `body()`, `body_len()`; the body framing the response declares (`Content-Length`, chunked, close-delimited) is followed, and a stream that ends inside a declared body is an error |
+| `http` | the pure request builder and response-head parser (shared with the vendored path, host-tested) |
+| `url` | the pure `https://host[:port][/path]` parser (host-tested) |
+| `vendored` | the 0.7.0 userland stack, compiled only with the `vendored-tls` feature |
 
-Every handshake is refused unless the chain validates against the committed
-`ca_bundle` (6 curated roots: ISRG X1/X2, GTS R1/R4, SSL.com ECC/RSA 2022), the
-leaf's SAN entries authorize `server_name` (RFC 6125, **no** CN fallback), the
-caller's clock is at or above `CLOCK_FLOOR` (2025-01-01), the
-`CertificateVerify` signature checks out, **and** a certificate was actually
-verified during that handshake (a post-handshake gate independent of the state
-machine). Refusals print the gate that refused — `tls: verify FAILED cause=…`
-with `chain`, `hostname`, `no-hostname`, `leaf-key`, `clock`,
-`signature-scheme` or `signature` — and successes print the leaf fingerprint,
-the chain length and the anchors, so the transcript can be cross-checked
-against `openssl s_client` on the host.
+**What is verified, and by whom.** The **kernel** verifies, before a single
+application byte can move: the chain must reach an anchor of its committed CA
+bundle (6 curated roots: ISRG X1/X2, GTS R1/R4, SSL.com ECC/RSA 2022), the SAN
+entries must authorize the `host` the caller passed (RFC 6125, **no** CN
+fallback — and that name is also the SNI, so pinning an address cannot bypass
+it), the certificate validity windows must contain the machine's real time from
+its goldfish RTC, `CertificateVerify` must prove possession of the leaf key,
+and the kernel independently requires that a certificate was verified *during
+this* handshake before it hands out the session. A refusal arrives as
+`EKEYREJECTED` (errno 129, `ErrorKind::PermissionDenied`) for a rejected
+certificate, `EPROTO` for a malformed handshake, `ENOTSUP` when the machine has
+no wall clock and `EAGAIN` when the entropy pool has no seed; the kernel prints
+the exact gate on the serial line (`tls: verify FAILED cause=chain|hostname|
+clock|signature`, `tls: user session host=… REFUSED cause=NoEntropy|NoClock`).
 
-**The two inputs the ABI cannot supply.** `clock_gettime(CLOCK_REALTIME)` on
-this kernel is the uptime counter (both clock ids map to `timer::uptime_ms()`),
-and there is no RTC syscall; there is also no `getrandom`, no `/dev/urandom`
-and no entropy syscall (the kernel's own pool is seeded from
-`/chosen/rng-seed`, which userland cannot reach). A TLS client that invented
-either would be a facade, so `TlsStream::connect` **requires** `now_unix` and a
-32-byte seed from the caller: no clock below the floor, and no entropy, means
-no handshake. The live acceptance run supplies both from the host harness (real
-Unix seconds and a staged `/mnt/seed`), and the transcript says so.
+**No clock, no entropy, no flags.** 0.7.0's userland client had to ask the
+caller for a wall clock and 32 bytes of entropy because the ABI had neither;
+`getrandom` (278) and the RTC close that gap, and `TlsStream::connect` now
+takes nothing but a `host:port`. The kernel-backed path is the default because
+it is the one whose verifier a program cannot weaken, replace or forget to run.
+
+**The vendored 0.7.0 path** (`vendored-tls` feature, module
+`pagh_std::tls::vendored`) is kept for the case where the process itself must
+own the verifier, or must run on a kernel older than 0.21.0. It is the same
+`embedded-tls` 0.19.0 the kernel used to link, with the same deliberate local
+patch (upstream reached `ApplicationData` even when the server never sent
+`Certificate`, so the vendored state machine refuses `Finished` unless the
+certificate was received *and* verified) and the same ported pure verifier. Its
+`TlsStream::connect(stream, server_name, now_unix, &mut Entropy)` still takes
+the caller's clock — `clock_gettime(CLOCK_REALTIME)` is the uptime counter and
+there is no RTC syscall — which remains the honest gap in that path;
+`Entropy::from_kernel()` now fills the seed from `getrandom` instead of
+requiring 32 bytes from outside the machine, and `Entropy::from_seed`/`from_hex`
+stay for a harness that reproduces a transcript. Its refusals print the gate
+that refused (`tls: verify FAILED cause=…` with `chain`, `hostname`,
+`no-hostname`, `leaf-key`, `clock`, `signature-scheme` or `signature`) and its
+successes print the leaf fingerprint, chain length and anchor count, so a
+transcript can be cross-checked against `openssl s_client` on the host
+(`docs/live-sdk-0.7.0.txt`, re-verified on 0.21.0).
+
 
 ### `pagh_std::fmt`, `panic`, `ffi`
 
@@ -702,19 +781,20 @@ Impossible without new kernel syscalls (shown with the SDK's typed
 - **DNS**: `pagh_std::net::dns` is a stub resolver, not a system resolver: it
   has no IPv6/`AAAA`, no `MX`/`TXT`/`SRV`, no TCP fallback for a truncated
   answer, no cache, no `search`/`ndots` processing, and a transaction id that
-  varies but is not unpredictable (no entropy source). The ABI cannot report the
-  DHCP lease, so the server list comes from a configuration file or the
-  compiled-in `10.0.2.3` (documented, and the live run proves the value is the
-  leased one);
-- **TLS**: the SDK's TLS needs two inputs the ABI cannot supply — a wall clock
-  (`CLOCK_REALTIME` is uptime here, and there is no RTC syscall) and 32 bytes of
-  entropy (no `getrandom`, no `/dev/urandom`; the kernel's `/chosen/rng-seed`
-  pool is not reachable from userland). `TlsStream::connect` therefore takes
-  `now_unix` and an `Entropy` seed from the caller and refuses without them;
-  closing this properly needs a kernel change. Also absent: client certificates
-  (`mTLS`), session resumption, `close_notify` on drop, RSA-PSS *certificate*
-  signatures (the TLS 1.3 `CertificateVerify` PSS schemes are supported),
-  `no_std`-style PSK handshakes, and any TLS version below 1.3;
+  varies but is not unpredictable (a clock-seeded counter, not `getrandom`). The
+  ABI cannot report the DHCP lease, so the server list comes from a
+  configuration file or the compiled-in `10.0.2.3` (documented, and the live run
+  proves the value is the leased one);
+- **TLS**: the default path has no wall-clock or entropy limitation — the
+  kernel reads its RTC and its seeded pool (pagh-riscv 0.21.0) — but the
+  verifier is the kernel's, so a program cannot pin a different CA set, inspect
+  the chain, or see the leaf fingerprint through this API (`EKEYREJECTED` is
+  the whole answer; the serial line carries the gate). The `vendored-tls`
+  feature keeps the 0.7.0 userland client for that, at the cost of the caller's
+  wall clock, since the ABI still has no RTC read. Absent on both paths: client
+  certificates (`mTLS`), session resumption, `close_notify` on drop,
+  RSA-PSS *certificate* signatures (the TLS 1.3 `CertificateVerify` PSS schemes
+  are supported), pre-shared-key handshakes, and any TLS version below 1.3;
 - **`mpsc` is bounded**: `channel()` holds 32 values and `sync_channel(0)` is
   clamped to 1; there is no unbounded channel and no zero-capacity rendezvous;
 - **`Barrier`/`Once` deviations**: `Barrier::new(0)` waits for nobody and
@@ -730,8 +810,9 @@ Impossible without new kernel syscalls (shown with the SDK's typed
   (the ABI's `poll`), but there is no `select`/`epoll`; `read(0)` is
   non-blocking and never reports EOF, so `io::Stdin` blocks by yielding and
   `cat` with no file waits forever;
-- **real wall-clock time**, `SystemTime::now` as Unix time, time zones, RTC:
-  clock 0 is uptime at 10 ms resolution;
+- **real wall-clock time**, `SystemTime::now` as Unix time, time zones, an RTC
+  read: clock 0 is uptime at 10 ms resolution, and the kernel's own RTC is not
+  reachable from userland;
 - **`fsync`/`fdatasync`**, `dup`/`fcntl`, `statfs`, `utimes`, `chown`,
   `O_EXCL`, `O_DIRECTORY`, `O_NOFOLLOW`, `statat`/`lstat`: no ABI for them;
   `symlink_metadata`, `create_new` and `sync_*` are `Unsupported`;
@@ -803,7 +884,8 @@ The transcript covers:
 | `HashMap`/`HashSet` | 0.7.0 transcript: a `Hash + Eq` key with no `Ord`, 1000 inserts → `len=1000 capacity=1536`, 500 removals with the other 500 still reachable, 64 keys forced into one bucket then a middle deletion, `entry`/`retain`/`extend`/`FromIterator`/`Index`, set algebra |
 | DNS | 0.7.0 transcript: `/mnt/etc/resolv.conf` names the DHCP-leased server (the boot log's `dns 10.0.2.3`), a real `A` query with the server's TTLs, `NXDOMAIN`, `InvalidName` before any datagram, a 1 s deadline against a host black hole, and `connect("example.com:80")` → `HTTP/1.1 200 OK` |
 | socket options | 0.7.0 transcript: `SO_TYPE` → `Stream`/`Datagram`, `SO_REUSEADDR` accepted and the second `bind` still refused, non-blocking read `WouldBlock`, 500 ms read deadline and 300 ms UDP deadline enforced by the SDK, `try_clone` echo read back through the clone and the original still usable after it drops |
-| TLS 1.3 | 0.7.0 transcript: a live `https://example.com/` GET — chain to the committed bundle (`chain=4 anchors=6`), leaf `sha256:85ca6ab0…`, `CertificateVerify OK`, 577-byte body — and four refusals: `stage=clock`, `stage=entropy`, `cause=chain` (self-signed `openssl s_server`) and `cause=hostname` (a trusted Google chain for `example.com`) |
+| vendored TLS 1.3 | 0.7.0 transcript: a live `https://example.com/` GET through the userland client — chain to the committed bundle (`chain=4 anchors=6`), leaf `sha256:85ca6ab0…`, `CertificateVerify OK`, 577-byte body — and four refusals: `stage=clock`, `stage=entropy`, `cause=chain` (self-signed `openssl s_server`) and `cause=hostname` (a trusted Google chain for `example.com`) |
+| kernel-backed TLS | 0.8.0 transcript: `tls_get` fetching `https://example.com/` with **no clock and no seed argument** — `tls: verified leaf=sha256:85ca6ab0… chain=4 certs anchors=6 host=example.com`, `tls: CertificateVerify OK`, `tls: user session 0 open host=example.com (TLS 1.3, AES-128-GCM-SHA256, server authenticated, 110 ms)`, `status 200 body 577 bytes` — the same fetch through `TlsStream` (`--manual`), the vendored program seeded from `getrandom`, and two refusals: `cause=chain` and `cause=hostname`, both errno 129 |
 
 `python3 tools/live_check.py` reproduces the 0.4.0 matrix;
 `docs/live-rust-sdk.txt` is that captured run. `docs/live-sdk-0.5.0.txt` is the
@@ -812,7 +894,9 @@ tools/live_net.py` reproduces the 0.6.0 network/sync matrix in one boot and
 rewrites `docs/live-sdk-0.6.0.txt` (47/47 checks, kernel hash and ELF hashes
 included). `python3 tools/live_070.py` reproduces the 0.7.0 matrix in one boot
 and rewrites `docs/live-sdk-0.7.0.txt` (**55/55 checks**, kernel and ELF
-hashes included); the host unit tests are 34 checks
+hashes included). `python3 tools/live_080.py` reproduces the 0.8.0
+kernel-backed TLS matrix and rewrites `docs/live-sdk-0.8.0.txt` (**32/32
+checks**); the host unit tests are 37 checks
 (`cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`).
 
 ## CI
@@ -824,10 +908,12 @@ hashes included); the host unit tests are 34 checks
 3. runs `cargo fmt -p pagh_std -p pagh_hostcheck -p pagh_probes -- --check`
    (package-scoped because `--all` would reformat the sibling `pagh-api`);
 4. runs `./build.sh --fixtures` (all examples and probes);
-5. asserts every example — including `tcp_server`, `udp_echo` and
-   `sync_primitives` — is ≤ 1 MiB;
-6. runs `cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu --locked`;
-7. uploads the example ELFs.
+5. asserts every example a default build produces — including `tcp_server`,
+   `udp_echo`, `sync_primitives` and the kernel-backed `tls_get` — is ≤ 1 MiB;
+6. builds `--release --vendored` and checks `tls_get_vendored` (plus the release
+   sizes of the 0.7.0 examples) against the same limit;
+7. runs `cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu --locked`;
+8. uploads the example ELFs.
 
 The live QEMU check is intentionally not in CI: it needs the kernel checkout
 and QEMU, and the transcript is the acceptance artifact for this milestone.
