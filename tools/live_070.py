@@ -20,11 +20,15 @@ kernel's own launcher (`pagh-riscv/tools/run.py --net --keep`):
   not to change the kernel's bind behaviour, `set_nonblocking` measured,
   a 500 ms read deadline enforced by the SDK (the kernel ignores
   `SO_RCVTIMEO`), `try_clone` sharing one descriptor, and the UDP deadline;
-* `tls_get` — TLS 1.3 over a `TcpStream`: a live HTTPS GET of `example.com`
-  with the chain validated against the committed CA bundle, the SAN checked,
-  the clock gate applied and `CertificateVerify` verified — plus four refusals
-  (no clock, no entropy, a self-signed chain, a valid chain for the wrong
-  name), because a verifier is only as good as what it rejects.
+* `tls_get_vendored` — the 0.7.0 userland TLS 1.3 stack over a `TcpStream`: a
+  live HTTPS GET of `example.com` with the chain validated against the
+  committed CA bundle, the SAN checked, the clock gate applied and
+  `CertificateVerify` verified — plus four refusals (no clock, no entropy, a
+  self-signed chain, a valid chain for the wrong name), because a verifier is
+  only as good as what it rejects. Since 0.8.0 the default `tls_get` is the
+  kernel-backed client (`tools/live_080.py`); this harness drives the vendored
+  implementation, which is why it builds with `--vendored` and stages the
+  `tls_get_vendored` example.
 
 The guest is driven over the serial socket `run.py` leaves behind, one command
 at a time, because the shell's UART ring is 16 bytes deep.
@@ -58,7 +62,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 TARGET = "riscv64gc-unknown-none-elf"
 PROMPT = "pagh:rv64>"
 
-EXAMPLES = ("hash_map", "dns", "socket_opts", "tls_get")
+EXAMPLES = ("hash_map", "dns", "socket_opts", "tls_get_vendored")
 
 # The guest reaches the host's loopback as 10.0.2.2 through QEMU's user network,
 # so a host server needs no --hostfwd at all.
@@ -415,10 +419,12 @@ class Guest:
 
 def build(args: argparse.Namespace) -> pathlib.Path:
     if not args.skip_build:
-        info("building release ELFs (./build.sh --release)")
-        result = subprocess.run([str(ROOT / "build.sh"), "--release"], cwd=ROOT, text=True)
+        info("building release ELFs (./build.sh --release --vendored)")
+        result = subprocess.run(
+            [str(ROOT / "build.sh"), "--release", "--vendored"], cwd=ROOT, text=True
+        )
         if result.returncode != 0:
-            die("build.sh --release failed")
+            die("build.sh --release --vendored failed")
     examples = ROOT / "target" / TARGET / "release" / "examples"
     for name in EXAMPLES:
         if not (examples / name).is_file():
@@ -528,7 +534,7 @@ FAILURE_MARKERS = {
     "hash_map": "HASH_MAP FAIL",
     "dns": "DNS FAIL",
     "socket_opts": "SOCKET_OPTS FAIL",
-    "tls_get": "TLS_GET FAIL",
+    "tls_get_vendored": "TLS_GET FAIL",
 }
 
 
@@ -691,7 +697,7 @@ def run_guest(
         fetch = run_scenario(
             guest,
             checks,
-            f"run /mnt/tls_get https://{PROOF_HOST}/ {now_unix} @/mnt/seed",
+            f"run /mnt/tls_get_vendored https://{PROOF_HOST}/ {now_unix} @/mnt/seed",
             "TLS_GET PASS",
             (
                 "tls: verified leaf=sha256:",
@@ -709,21 +715,21 @@ def run_guest(
         run_scenario(
             guest,
             checks,
-            f"run /mnt/tls_get https://{PROOF_HOST}/ 0 @/mnt/seed",
+            f"run /mnt/tls_get_vendored https://{PROOF_HOST}/ 0 @/mnt/seed",
             "TLS_GET FAIL",
             ("stage=clock cause=NoWallClock",),
         )
         run_scenario(
             guest,
             checks,
-            f"run /mnt/tls_get https://{PROOF_HOST}/ {now_unix} none",
+            f"run /mnt/tls_get_vendored https://{PROOF_HOST}/ {now_unix} none",
             "TLS_GET FAIL",
             ("stage=entropy cause=NoEntropy",),
         )
         run_scenario(
             guest,
             checks,
-            f"run /mnt/tls_get https://{PROOF_HOST}:{self_signed.port}/ {now_unix} @/mnt/seed "
+            f"run /mnt/tls_get_vendored https://{PROOF_HOST}:{self_signed.port}/ {now_unix} @/mnt/seed "
             f"--ip={HOST_FROM_GUEST}",
             "TLS_GET FAIL",
             ("tls: verify FAILED cause=chain", "TLS_GET FAIL: certificate rejected (chain)"),
@@ -732,7 +738,7 @@ def run_guest(
             run_scenario(
                 guest,
                 checks,
-                f"run /mnt/tls_get https://{PROOF_HOST}/ {now_unix} @/mnt/seed --ip={mismatch_ip}",
+                f"run /mnt/tls_get_vendored https://{PROOF_HOST}/ {now_unix} @/mnt/seed --ip={mismatch_ip}",
                 "TLS_GET FAIL",
                 (
                     "tls: verify FAILED cause=hostname",
@@ -742,13 +748,13 @@ def run_guest(
         run_scenario(
             guest,
             checks,
-            f"run /mnt/tls_get https://{PROOF_HOST}/ {now_unix} @/mnt/seed --manual",
+            f"run /mnt/tls_get_vendored https://{PROOF_HOST}/ {now_unix} @/mnt/seed --manual",
             "TLS_GET PASS",
             (
-                "tls_get: verified leaf=sha256:",
+                "tls_get_vendored: verified leaf=sha256:",
                 "chain=",
                 "anchors=6",
-                "tls_get: response HTTP/1.1 200",
+                "tls_get_vendored: response HTTP/1.1 200",
             ),
         )
     finally:
@@ -794,7 +800,7 @@ def write_transcript(
         f"guest image:        `mke2fs -q -t ext2 -F -b 4096 -d <rootfs>`",
         f"staging root:       {', '.join(EXAMPLES)}, etc/resolv.conf (nameserver "
         f"{facts.get('dhcp_dns')})",
-        "build:              ./build.sh --release (release profile, strip debuginfo)",
+        "build:              ./build.sh --release --vendored (release profile, strip debuginfo)",
     ]
     for name in EXAMPLES:
         path_ = examples / name
