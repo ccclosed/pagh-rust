@@ -659,7 +659,7 @@ def run_guest(
             checks,
             f"run /mnt/dns --server={HOST_FROM_GUEST} --port={black_hole.port} --deadline-ms=1000",
             "DNS PASS",
-            ("dns: silent server -> Timeout after", "budget 2000 ms"),
+            ("dns: silent server -> Timeout after", "budget 2100 ms"),
         )
         checks.check(
             black_hole.received >= 1,
@@ -764,10 +764,13 @@ def run_guest(
 
 
 def shell_transcript(text: str) -> str:
-    """Drop the boot banner and normalise CRLF for the committed transcript."""
-    index = text.find(PROMPT)
-    if index >= 0:
-        text = text[index:]
+    """Normalise CRLF for the committed transcript.
+
+    Nothing is trimmed: the driver connects *after* `run.py` has seen the boot
+    prompt, so the captured session starts at the first command the driver
+    typed. Cutting at the first `pagh:rv64>` would silently drop that first
+    command's output (and the header promises the whole session).
+    """
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
@@ -818,8 +821,9 @@ def write_transcript(
         lines.append(f"  FAIL  {item}")
     lines += [
         "",
-        "The transcript below is the complete shell session from the first prompt; the",
-        "OpenSBI/kernel boot banner is omitted and CRLF is normalized to LF.",
+        "The transcript below is the shell session from the first command the driver",
+        "typed to the last (the boot banner is not replayed on reconnect); CRLF is",
+        "normalized to LF.",
         "",
         "===== serial transcript =====",
         "",

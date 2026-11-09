@@ -185,7 +185,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         match resolver.resolve_a("example.com") {
             Err(dns::Error::Timeout) => {
                 let elapsed = started.elapsed().as_millis();
-                let budget = (deadline_ms * 2) as u128;
+                // Two attempts of `deadline_ms` each, plus the kernel's 10 ms
+                // tick granularity for the deadline check itself: a bound with
+                // no headroom measures the scheduler, not the retry budget.
+                // What it rules out is the kernel's own ~10 s receive.
+                let budget = (deadline_ms * 2 + 100) as u128;
                 if elapsed > budget {
                     failures += 1;
                     println!("dns: deadline FAIL: took {elapsed} ms for a {budget} ms budget");
