@@ -1,0 +1,197 @@
+pagh-rust 0.7.0 — live QEMU acceptance transcript
+============================================================
+
+date:               2026-11-09 17:26:40 +0300
+kernel:             /home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh sha256 30a375a5525a7253183c47f2889ae214ae4b8c2707527331263c1f0508863a8f
+kernel launcher:    pagh-riscv/tools/run.py --net --keep (guest 10.0.2.15/24)
+guest image:        `mke2fs -q -t ext2 -F -b 4096 -d <rootfs>`
+staging root:       hash_map, dns, socket_opts, tls_get, etc/resolv.conf (nameserver 10.0.2.3)
+build:              ./build.sh --release (release profile, strip debuginfo)
+release ELF:        hash_map sha256 73ea8692431ed22cfde5f7b1ece845784bacc869b75082243a5414ec17242a77
+release ELF:        dns sha256 d43dcce080b8b4ff1b4abcb381ec31cc730f224f89701d5499b3e3ef89eda6eb
+release ELF:        socket_opts sha256 6bd3da151a07ba73974723131c81f39711a1b630e4b4806e541d3c853d69e85a
+release ELF:        tls_get sha256 19202a1b9412dbcea26d2f131106057d7af3a7cce7e50c0b8dbcdda533210d12
+
+guest address:      10.0.2.15 (DHCP, from the boot log)
+DHCP DNS server:    10.0.2.3 (the value staged in resolv.conf)
+host echo peer:     127.0.0.1:40571 == guest 10.0.2.2:40571
+host TLS server:    openssl s_server (self-signed example.com) on 10.0.2.2:52651
+TLS proof host:     https://example.com/ (chain -> SSL.com TLS ECC Root CA 2022)
+SAN-negative host:  www.google.com (142.251.156.119) — trusted chain, wrong name
+wall clock source:  host SystemTime -> argv (1794234404)
+entropy source:     32 bytes staged in /mnt/seed -> argv (@/mnt/seed)
+
+checks:             55 passed, 0 failed
+  PASS  boot log: DHCP ip 10.0.2.15 gw 10.0.2.2 dns 10.0.2.3
+  PASS  the DHCP-leased DNS server is the one staged in /etc/resolv.conf (10.0.2.3)
+  PASS  `run /mnt/hash_map` -> HASH_MAP PASS
+  PASS  `run /mnt/hash_map` printed 'hash_map: Hash+Eq key with no Ord: OK'
+  PASS  `run /mnt/hash_map` printed 'capacity=1536 (real spare capacity)'
+  PASS  `run /mnt/hash_map` printed '64 keys in one bucket'
+  PASS  `run /mnt/hash_map` printed 'hash_set: 2 elements'
+  PASS  `run /mnt/dns` -> DNS PASS
+  PASS  `run /mnt/dns` printed 'dns: 1 server(s) from /mnt/etc/resolv.conf: 10.0.2.3'
+  PASS  `run /mnt/dns` printed 'dns: example.com -> '
+  PASS  `run /mnt/dns` printed 'dns: no-such-host.invalid -> NXDOMAIN (as required)'
+  PASS  `run /mnt/dns` printed 'dns: bad..name -> InvalidName'
+  PASS  the A query reports the server's answer time
+  PASS  `run /mnt/dns --connect=example.com:80` -> DNS PASS
+  PASS  `run /mnt/dns --connect=example.com:80` printed 'dns: TcpStream::connect_host('
+  PASS  `run /mnt/dns --connect=example.com:80` printed 'dns: connect('
+  PASS  `run /mnt/dns --connect=example.com:80` printed ' 200 OK'
+  PASS  `run /mnt/dns --server=10.0.2.2 --port=43591 --deadline-ms=1000` -> DNS PASS
+  PASS  `run /mnt/dns --server=10.0.2.2 --port=43591 --deadline-ms=1000` printed 'dns: silent server -> Timeout after'
+  PASS  `run /mnt/dns --server=10.0.2.2 --port=43591 --deadline-ms=1000` printed 'budget 2000 ms'
+  PASS  the black hole at 10.0.2.2:43591 received the query
+  PASS  `run /mnt/socket_opts --peer=10.0.2.2:40571` -> SOCKET_OPTS PASS
+  PASS  `run /mnt/socket_opts --peer=10.0.2.2:40571` printed 'getsockopt(SO_TYPE) on a listener -> Stream'
+  PASS  `run /mnt/socket_opts --peer=10.0.2.2:40571` printed 'setsockopt(SO_REUSEADDR, 1) -> accepted by the ABI'
+  PASS  `run /mnt/socket_opts --peer=10.0.2.2:40571` printed 'the option is accepted, not honoured'
+  PASS  `run /mnt/socket_opts --peer=10.0.2.2:40571` printed 'non-blocking read on an idle socket -> WouldBlock in'
+  PASS  `run /mnt/socket_opts --peer=10.0.2.2:40571` printed '500 ms read deadline on a silent peer -> WouldBlock after'
+  PASS  `run /mnt/socket_opts --peer=10.0.2.2:40571` printed 'try_clone -> shared fd'
+  PASS  `run /mnt/socket_opts --peer=10.0.2.2:40571` printed 'wrote on the original, read the echo on the clone'
+  PASS  `run /mnt/socket_opts --peer=10.0.2.2:40571` printed 'original usable after the clone dropped'
+  PASS  `run /mnt/socket_opts --peer=10.0.2.2:40571` printed 'getsockopt(SO_TYPE) on a UdpSocket -> Datagram'
+  PASS  `run /mnt/socket_opts --peer=10.0.2.2:40571` printed 'UDP 300 ms receive deadline -> WouldBlock after'
+  PASS  the host echo peer saw the guest's connection
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed` -> TLS_GET PASS
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed` printed 'tls: verified leaf=sha256:'
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed` printed 'tls: CertificateVerify OK'
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed` printed 'tls: handshake OK'
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed` printed 'tls: fetch OK'
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed` printed 'Example Domain'
+  PASS  the live fetch took no refusal path
+  PASS  `run /mnt/tls_get https://example.com/ 0 @/mnt/seed` -> TLS_GET FAIL
+  PASS  `run /mnt/tls_get https://example.com/ 0 @/mnt/seed` printed 'stage=clock cause=NoWallClock'
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 none` -> TLS_GET FAIL
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 none` printed 'stage=entropy cause=NoEntropy'
+  PASS  `run /mnt/tls_get https://example.com:52651/ 1794234404 @/mnt/seed --ip=10.0.2.2` -> TLS_GET FAIL
+  PASS  `run /mnt/tls_get https://example.com:52651/ 1794234404 @/mnt/seed --ip=10.0.2.2` printed 'tls: verify FAILED cause=chain'
+  PASS  `run /mnt/tls_get https://example.com:52651/ 1794234404 @/mnt/seed --ip=10.0.2.2` printed 'TLS_GET FAIL: certificate rejected (chain)'
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed --ip=142.251.156.119` -> TLS_GET FAIL
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed --ip=142.251.156.119` printed 'tls: verify FAILED cause=hostname'
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed --ip=142.251.156.119` printed 'TLS_GET FAIL: certificate rejected (hostname)'
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed --manual` -> TLS_GET PASS
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed --manual` printed 'tls_get: verified leaf=sha256:'
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed --manual` printed 'chain='
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed --manual` printed 'anchors=6'
+  PASS  `run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed --manual` printed 'tls_get: response HTTP/1.1 200'
+
+The transcript below is the complete shell session from the first prompt; the
+OpenSBI/kernel boot banner is omitted and CRLF is normalized to LF.
+
+===== serial transcript =====
+
+pagh:rv64> run /mnt/dns
+dns: 1 server(s) from /mnt/etc/resolv.conf: 10.0.2.3
+dns: example.com -> 8.6.112.0 (attempt 20 ms)
+dns: example.com -> 8.47.69.0 (attempt 40 ms)
+dns: no-such-host.invalid -> NXDOMAIN (as required)
+dns: bad..name -> InvalidName (refused before any datagram)
+DNS PASS
+run: /mnt/dns exited with code 0
+pagh:rv64> run /mnt/dns --connect=example.com:80
+dns: 1 server(s) from /mnt/etc/resolv.conf: 10.0.2.3
+dns: example.com -> 8.6.112.0 (attempt 0 ms)
+dns: example.com -> 8.47.69.0 (attempt 20 ms)
+dns: no-such-host.invalid -> NXDOMAIN (as required)
+dns: bad..name -> InvalidName (refused before any datagram)
+dns: TcpStream::connect_host(example.com:80) -> peer 8.6.112.0:80 fd 3
+dns: connect(example.com:80) -> HTTP/1.1 200 OK
+DNS PASS
+run: /mnt/dns exited with code 0
+pagh:rv64> run /mnt/dns --server=10.0.2.2 --port=43591 --deadline-ms=1000
+dns: 1 server(s) from /mnt/etc/resolv.conf: 10.0.2.3
+dns: --server override: asking only 10.0.2.2
+dns: --port override: asking port 43591
+dns: --server override: skipping the name checks (this run measures the deadline)
+dns: bad..name -> InvalidName (refused before any datagram)
+dns: silent server -> Timeout after 2000 ms (budget 2000 ms)
+DNS PASS
+run: /mnt/dns exited with code 0
+pagh:rv64> run /mnt/socket_opts --peer=10.0.2.2:40571
+socket_opts: getsockopt(SO_TYPE) on a listener -> Stream
+socket_opts: setsockopt(SO_REUSEADDR, 1) -> accepted by the ABI
+socket_opts: second bind(45681) still refused (Error { kind: Uncategorized, errno: Some(Unknown), message: None }): the option is accepted, not honoured
+socket_opts: getsockopt(SO_TYPE) on a TcpStream -> Stream
+socket_opts: non-blocking read on an idle socket -> WouldBlock in 10 ms
+socket_opts: 500 ms read deadline on a silent peer -> WouldBlock after 500 ms
+socket_opts: read_timeout() reports Some(500ms)
+socket_opts: try_clone -> shared fd 4 (the ABI refuses dup on a socket)
+socket_opts: wrote on the original, read the echo on the clone (23 bytes)
+socket_opts: original usable after the clone dropped
+socket_opts: getsockopt(SO_TYPE) on a UdpSocket -> Datagram
+socket_opts: UDP 300 ms receive deadline -> WouldBlock after 300 ms
+socket_opts: accept_nonblocking on an idle listener -> WouldBlock
+SOCKET_OPTS PASS
+run: /mnt/socket_opts exited with code 0
+pagh:rv64> run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed
+tls_get: entropy = ChaCha20 over 32 bytes from /mnt/seed
+tls_get: url=https://example.com/ host=example.com port=443 path=/ now=1794234404 pinned=None
+tls: fetch host=example.com port=443 path=/
+tls: resolve example.com -> 8.47.69.0
+tls: tcp connected to 8.47.69.0:443
+tls: CA bundle 6 roots (0 unparsable), server_name=example.com
+tls: verified leaf=sha256:85ca6ab068e9bcce88b6c4aa3c47f7d17228134a457f870d3800e6223a0df07a chain=4 anchors=6 host=example.com now=1794234404
+tls: CertificateVerify OK (server proved possession of the leaf key)
+tls: handshake OK (TLS 1.3, AES-128-GCM-SHA256, server authenticated)
+tls: read 926 bytes (total 926)
+tls: response 200, transfer-encoding chunked, body starts at 342
+tls: read 5 bytes (total 931)
+tls: fetch OK body=577 bytes in 350 ms
+tls_get: body 577 bytes, first line: <!doctype html><html lang=en><head><meta charset=utf-8><link rel=icon href=data:,><meta name=viewport content="width=device-width,initial-scale=1"><title>Example Domain</title><style>html{color-scheme:light dark;background:light-dark(#eee,#222)}body{font:16px/1.6 system-ui,sans-serif;max-width:26em;margin:auto;padding:25vh 2em 2em;text-align:center}</style></head><body><p>This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.</p><script src=/s.js></script></body></html>
+TLS_GET PASS
+run: /mnt/tls_get exited with code 0
+pagh:rv64> run /mnt/tls_get https://example.com/ 0 @/mnt/seed
+tls_get: entropy = ChaCha20 over 32 bytes from /mnt/seed
+tls_get: url=https://example.com/ host=example.com port=443 path=/ now=0 pinned=None
+tls: fetch host=example.com port=443 path=/
+tls: resolve example.com -> 8.6.112.0
+tls: tcp connected to 8.6.112.0:443
+tls: FAILED stage=clock cause=NoWallClock (0 is below the validity floor 1735689600)
+TLS_GET FAIL: no wall clock below the validity floor
+run: /mnt/tls_get exited with code 1
+pagh:rv64> run /mnt/tls_get https://example.com/ 1794234404 none
+tls_get: FAIL stage=entropy cause=NoEntropy (the ABI has no getrandom and no /dev/urandom; the caller must supply the seed)
+TLS_GET FAIL: no entropy supplied
+run: /mnt/tls_get exited with code 1
+pagh:rv64> run /mnt/tls_get https://example.com:52651/ 1794234404 @/mnt/seed --ip=10.0.2.2
+tls_get: entropy = ChaCha20 over 32 bytes from /mnt/seed
+tls_get: url=https://example.com:52651/ host=example.com port=52651 path=/ now=1794234404 pinned=Some(Ipv4([10, 0, 2, 2]))
+tls: fetch host=example.com port=52651 path=/
+tls: address pinned by the caller -> 10.0.2.2
+tls: tcp connected to 10.0.2.2:52651
+tls: CA bundle 6 roots (0 unparsable), server_name=example.com
+tls: verify FAILED cause=chain
+tls: FAILED stage=handshake cause=Handshake (InvalidCertificate)
+TLS_GET FAIL: certificate rejected (chain)
+run: /mnt/tls_get exited with code 1
+pagh:rv64> run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed --ip=142.251.156.119
+tls_get: entropy = ChaCha20 over 32 bytes from /mnt/seed
+tls_get: url=https://example.com/ host=example.com port=443 path=/ now=1794234404 pinned=Some(Ipv4([142, 251, 156, 119]))
+tls: fetch host=example.com port=443 path=/
+tls: address pinned by the caller -> 142.251.156.119
+tls: tcp connected to 142.251.156.119:443
+tls: CA bundle 6 roots (0 unparsable), server_name=example.com
+tls: verify FAILED cause=hostname
+tls: FAILED stage=handshake cause=Handshake (InvalidCertificate)
+TLS_GET FAIL: certificate rejected (hostname)
+run: /mnt/tls_get exited with code 1
+pagh:rv64> run /mnt/tls_get https://example.com/ 1794234404 @/mnt/seed --manual
+tls_get: entropy = ChaCha20 over 32 bytes from /mnt/seed
+tls_get: url=https://example.com/ host=example.com port=443 path=/ now=1794234404 pinned=None
+tls_get: address 8.6.112.0:443
+tls: CA bundle 6 roots (0 unparsable), server_name=example.com
+tls: verified leaf=sha256:85ca6ab068e9bcce88b6c4aa3c47f7d17228134a457f870d3800e6223a0df07a chain=4 anchors=6 host=example.com now=1794234404
+tls: CertificateVerify OK (server proved possession of the leaf key)
+tls: handshake OK (TLS 1.3, AES-128-GCM-SHA256, server authenticated)
+tls_get: record buffers: read 16640 B, write 16640 B
+tls_get: verified leaf=sha256:85ca6ab068e9bcce88b6c4aa3c47f7d17228134a457f870d3800e6223a0df07a chain=4 anchors=6 now=1794234404 peer=8.6.112.0:443 name=example.com
+tls: peer sent close_notify (clean end of stream)
+tls_get: read 931 response bytes
+tls_get: response HTTP/1.1 200
+tls_get: body 577 bytes, first line: <!doctype html><html lang=en><head><meta charset=utf-8><link rel=icon href=data:,><meta name=viewport content="width=device-width,initial-scale=1"><title>Example Domain</title><style>html{color-scheme:light dark;background:light-dark(#eee,#222)}body{font:16px/1.6 system-ui,sans-serif;max-width:26em;margin:auto;padding:25vh 2em 2em;text-align:center}</style></head><body><p>This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.</p><script src=/s.js></script></body></html>
+TLS_GET PASS
+run: /mnt/tls_get exited with code 0
+pagh:rv64> 

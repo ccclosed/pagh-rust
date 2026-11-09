@@ -13,38 +13,55 @@ stack, a wall clock and a dynamic loader that the pagh ABI does not have.
 What *is* fully real is **Rust the language** plus the `alloc` crate:
 
 - generics, traits, closures, iterators, pattern matching, `Result`/`Option`;
-- `Vec`, `String`, `VecDeque`, `BTreeMap`, `BTreeSet`, `BinaryHeap`;
+- `Vec`, `String`, `VecDeque`, `BTreeMap`, `BTreeSet`, `BinaryHeap`, and a
+  real open-addressing `HashMap`/`HashSet` (0.7.0);
 - `format!`, `println!`, `write!` and the rest of `core::fmt`;
 - a 1 MiB bump heap over `brk`, with `Vec`/`String` growth and OOM handling;
 - this crate's std-shaped layer over files, directories, arguments, paths,
   buffered I/O, time, process exit, native/scoped threads, synchronisation
   (mutexes, rwlocks, condition variables, channels, barriers, `Once`), signals,
-  and the ABI's IPv4 sockets: a TCP client, a TCP listener and UDP datagrams.
+  and the ABI's IPv4 sockets: a TCP client, a TCP listener and UDP datagrams;
+- a **DNS stub resolver** (`pagh_std::net::dns`, RFC 1035 over a `UdpSocket`)
+  and `connect("host:port")`, because the ABI has no resolver call;
+- **TLS 1.3** (`pagh_std::tls`, vendored `embedded-tls` 0.19.0) with fail-closed
+  server authentication: chain to a committed CA bundle, SAN hostname check, a
+  clock gate and `CertificateVerify`. The ABI has **no entropy source and no
+  wall clock**, so the caller supplies both; nothing is invented in their
+  place.
 
 `pagh_std` does **not** claim to be `std`, does not provide dynamic linking or
 `OsStr`, and returns a typed `io::ErrorKind::Unsupported` for operations the
 ABI cannot express. Those are listed under
 [Limitations vs std](#limitations-vs-std).
 
-**Live evidence:** [`docs/live-sdk-0.6.0.txt`](docs/live-sdk-0.6.0.txt) is the
-QEMU serial transcript for this release — one boot that runs the whole 0.6.0
-matrix, **47/47 checks passed** against `pagh-riscv 0.19.0` / QEMU 10.2.2:
-`SYNC_PRIMITIVES PASS` (a bounded channel with three producers blocking on two
-slots, `try_send`/`try_recv`/`recv_timeout`/disconnect, a 4-party barrier over
-two generations, and a 4-thread `Once` race), `UDP_ECHO PASS` (two datagrams
-round-tripped through a host echo server, the `WouldBlock` single-poll shape,
-and the kernel's 1024-byte ceiling), `TCP_SERVER PASS` (bind, the
-`accept_nonblocking` → `WouldBlock` probe, two `accept`s with `peer_addr`, and
-224 + 400 bytes echoed back to a host `--hostfwd` client), plus the `cat`,
-`condvar` and `TcpStream` (`io_traits net`) regressions. The earlier
+**Live evidence:** [`docs/live-sdk-0.7.0.txt`](docs/live-sdk-0.7.0.txt) is the
+QEMU serial transcript for this release — one boot that runs the whole 0.7.0
+matrix, **55/55 checks passed** against `pagh-riscv 0.19.0` / QEMU 10.2.2:
+`HASH_MAP PASS` (a `Hash + Eq` key with no `Ord`, 1000 keys → `capacity 1536`,
+500 removals, 64 keys in one bucket), `DNS PASS` (a real `A` query answered by
+the DHCP-leased server the script read out of the kernel's own boot log,
+`NXDOMAIN`, `InvalidName`, a 1 s deadline against a host black hole, and
+`connect("example.com:80")` → `HTTP/1.1 200 OK`), `SOCKET_OPTS PASS`
+(`getsockopt(SO_TYPE)`, `SO_REUSEADDR` accepted *and* the second `bind` still
+refused, non-blocking read, a 500 ms SDK-enforced read deadline, `try_clone`
+sharing one descriptor, the UDP deadline) and `TLS_GET PASS` — a live
+`https://example.com/` fetch through a TLS 1.3 handshake whose chain validates
+against the committed CA bundle (`chain=4 anchors=6`, leaf
+`sha256:85ca6ab0…`), plus four refusals (`stage=clock`, `stage=entropy`,
+`cause=chain`, `cause=hostname`).
+
+The earlier transcripts remain the evidence for their releases:
+[`docs/live-sdk-0.6.0.txt`](docs/live-sdk-0.6.0.txt) (47/47: TCP listener, UDP,
+mpsc, barrier, `Once` and the `TcpStream` client),
 [`docs/live-sdk-0.5.0.txt`](docs/live-sdk-0.5.0.txt) (condvar/io-traits) and
-[`docs/live-rust-sdk.txt`](docs/live-rust-sdk.txt) (62/62, the 0.4.0 surface,
-kernel 0.11.0) remain the transcripts for those releases.
+[`docs/live-rust-sdk.txt`](docs/live-rust-sdk.txt) (62/62, the 0.4.0 surface).
 
 ## Repository layout
 
 ```
 Cargo.toml                 workspace: pagh_std, hostcheck, diagnostic probes
+vendor/                    byte-pinned crates (embedded-tls + the verify-only
+                           crypto backends), wired through .cargo/config.toml
 rust-toolchain.toml        pinned nightly-2026-07-12 + riscv64gc target
 .cargo/config.toml         target + pagh-user.ld + rust-lld (sibling layout)
 build.sh                   builds the example ELFs (honours PAGH_API)
@@ -57,28 +74,42 @@ pagh_std/src/
   path.rs                  UTF-8 Path/PathBuf/Components + lexical normalize
   time.rs                  Duration, Instant, SystemTime, sleep/sleep_until
   process.rs               exit/abort/fork/execve/wait/Command
-  collections/             alloc containers + HashMap/HashSet BTree shims
+  collections/             alloc containers + the real HashMap/HashSet
+                           (Robin Hood probing, backward-shift deletion)
   hash.rs                  core::hash re-exports + deterministic hasher
   lazy.rs                  single-threaded LazyLock (pure core; host-tested)
   sync.rs                  Cell/RefCell/OnceCell + futex Mutex/RwLock/Condvar,
                            Barrier, Once
   sync/mpsc.rs             bounded Sender/Receiver channel over Mutex+Condvar
   thread.rs                Builder/JoinHandle/futex + thread::scope
-  net.rs                   Ipv4/SocketAddr, TcpStream, TcpListener, UdpSocket
+  net.rs                   Ipv4/SocketAddr, TcpStream/TcpListener/UdpSocket,
+                           socket options, connect(host:port)
+  net/dns.rs               the stub resolver (RFC 1035 over a UdpSocket)
+  net/dns_wire.rs          the pure query/response codec (host-tested)
+  tls/mod.rs               TLS 1.3 docs + the fail-closed contract
+  tls/stream.rs            TlsStream/Entropy/https_get over embedded-tls
+  tls/{x509,tls_verify,tls_chain,tls_auth,hostname,http,ca_bundle}.rs
+                           the ported pure verifier + the committed CA bundle
   fmt.rs                   core::fmt re-exports
   panic.rs                 PanicInfo/abort + the runtime contract
   ffi.rs                   c_* types, CStr/CString
 examples/                  cat, wc, find, threads_mutex, spawn, condvar, io_traits,
-                           tcp_server, udp_echo, sync_primitives
-hostcheck/                 host cargo test for path/hash/LazyLock logic
+                           tcp_server, udp_echo, sync_primitives, hash_map, dns,
+                           socket_opts, tls_get
+hostcheck/                 host cargo test for the pure modules (path, hash,
+                           collections, lazy, dns_wire, tls hostname/http)
 tools/probes/              panic/oom/chdir/fsops/clock diagnostic programs
 tools/live_check.py        builds, boots QEMU, runs the 0.4.0 filesystem matrix
+tools/live_070.py          the 0.7.0 live matrix: hash map, DNS, socket
+                           options, TLS 1.3 (one boot, one transcript)
 tools/live_net.py          the 0.6.0 network/sync live matrix (one boot, one
                            command at a time, host peers, docs/ transcript)
 .github/workflows/ci.yml   fmt + RISC-V build + host tests
 docs/live-rust-sdk.txt     the 0.4.0 captured live run
 docs/live-sdk-0.5.0.txt    the 0.5.0 condvar/io-traits captured runs
 docs/live-sdk-0.6.0.txt    the 0.6.0 network/sync captured run (47/47)
+docs/live-sdk-0.7.0.txt    the 0.7.0 captured run (55/55: hash map, DNS,
+                           socket options, TLS 1.3)
 ```
 
 ## A program
@@ -138,20 +169,23 @@ relative path in `.cargo/config.toml` and therefore needs the sibling layout.
 ./build.sh --fixtures       # also build panic/oom/chdir/fsops/clock probes
 ```
 
-Outputs (the kernel refuses images above 1 MiB; these are ~140–250 KiB):
+Outputs (the kernel refuses images above 1 MiB — `run_file_with_argv0` checks
+the size before mapping anything):
 
 ```text
-target/riscv64gc-unknown-none-elf/debug/examples/cat
-target/riscv64gc-unknown-none-elf/debug/examples/wc
-target/riscv64gc-unknown-none-elf/debug/examples/find
-target/riscv64gc-unknown-none-elf/debug/examples/threads_mutex
-target/riscv64gc-unknown-none-elf/debug/examples/spawn
-target/riscv64gc-unknown-none-elf/debug/examples/condvar
-target/riscv64gc-unknown-none-elf/debug/examples/io_traits
-target/riscv64gc-unknown-none-elf/debug/examples/tcp_server
-target/riscv64gc-unknown-none-elf/debug/examples/udp_echo
-target/riscv64gc-unknown-none-elf/debug/examples/sync_primitives
+target/riscv64gc-unknown-none-elf/debug/examples/cat … sync_primitives   (~170–260 KiB)
+target/riscv64gc-unknown-none-elf/debug/examples/hash_map                210 KiB
+target/riscv64gc-unknown-none-elf/debug/examples/dns                     316 KiB
+target/riscv64gc-unknown-none-elf/debug/examples/socket_opts             278 KiB
+target/riscv64gc-unknown-none-elf/release/examples/tls_get               772 KiB
 ```
+
+**`tls_get` is release-only.** The TLS example links `embedded-tls` and the
+verify-only crypto backends (RSA, P-256/P-384, Ed25519) whose *debug* build is
+1.19 MiB — over the kernel's limit; `./build.sh --release` brings it to 772 KiB
+and that is the profile the live matrix runs. `tools/live_070.py` always builds
+release for exactly this reason, and CI gates the release size of all four
+0.7.0 examples.
 
 Equivalent Cargo invocation:
 
@@ -168,15 +202,18 @@ dynamic section.
 ### Host tests
 
 The pure path logic can be compiled for the host; `libpagh` itself cannot
-(RISC-V `ecall` assembly). `hostcheck` includes `pagh_std/src/path.rs`
-directly:
+(RISC-V `ecall` assembly). `hostcheck` includes the pure sources directly —
+`path.rs`, `hash.rs`, `collections/{hash_map,hash_set}.rs`, `lazy.rs`,
+`net/dns_wire.rs`, `tls/{hostname,http}.rs` — 34 checks:
 
 ```sh
 cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu
 ```
 
 CI runs that plus `cargo fmt -p pagh_std -p pagh_hostcheck -p pagh_probes --
---check`, `./build.sh --fixtures`, and a 1 MiB size check. (The package-scoped
+--check`, `./build.sh --fixtures`, a 1 MiB size check for the ten original
+debug examples, and a release size check for the four 0.7.0 ones
+(`tls_get` is release-only: its debug build is over the limit). (The package-scoped
 form is deliberate: `cargo fmt --all` also formats local path dependencies, and
 the sibling `pagh-api` checkout must not be modified.) It checks out `pagh-rust` and `pagh-api` as siblings.
 
@@ -215,7 +252,17 @@ run /mnt/io_traits net 10.0.2.2 18080   # with --net and a host server
 run /mnt/sync_primitives
 run /mnt/udp_echo 10.0.2.2 18081 45680  # with --net and a host UDP echo server
 run /mnt/tcp_server 45679 2             # with --net --hostfwd 45679:45679
+run /mnt/hash_map
+run /mnt/dns
+run /mnt/dns --connect=example.com:80    # with --net: resolve + HTTP GET
+run /mnt/dns --server=10.0.2.2 --port=45690 --deadline-ms=1000   # silent server
+run /mnt/socket_opts --peer=10.0.2.2:45683                       # with --net: host echo
+run /mnt/tls_get https://example.com/ 1794234113 @/mnt/seed      # release build
 ```
+
+`tls_get` takes the wall clock and a seed from the caller (see
+[`pagh_std::tls`](#pagh_stdtls)); `@/mnt/seed` reads 64 hex characters from a
+file, which keeps the command inside the shell's 128-byte input line.
 
 The shell has no quoting or redirection, so an argument cannot contain a
 space, and there is no `cat < file`. Relative arguments are resolved against
@@ -273,6 +320,20 @@ must not connect before the guest is listening. Host peers: a UDP echo server
 (guest reaches it as `10.0.2.2:<port>`), a TCP server for `io_traits net`, and
 a two-connection TCP client for `tcp_server`. The transcript is
 `docs/live-sdk-0.6.0.txt`; exit status is 0 only when all 47 checks pass.
+
+For 0.7.0 the live check is `tools/live_070.py`, four new programs in one boot:
+
+```sh
+python3 tools/live_070.py                     # builds, boots, drives, writes docs/
+python3 tools/live_070.py --skip-build --keep-work
+```
+
+| program | what the boot proves |
+|---|---|
+| `hash_map` | a key type with `Hash + Eq` and **no `Ord`**, real spare `capacity()` (1000 keys → 1536 buckets), 500 removals with the other 500 still reachable, 64 keys forced into one bucket and a middle deletion that keeps the run reachable (backward shift, no tombstones), `entry`/`retain`/`extend`/`FromIterator`, `Index`, and `HashSet` set algebra |
+| `dns` | a real `A` query answered by the **DHCP-leased** server (the script reads `dns 10.0.2.3` out of the kernel's own boot log and stages exactly that value in `/etc/resolv.conf`, so lease → configuration → query is one chain), the server's TTLs, `NXDOMAIN`, an unencodable name refused before any datagram, a deadline against a host socket that never answers, and `connect("example.com:80")` doing a real HTTP GET |
+| `socket_opts` | `getsockopt(SO_TYPE)` for a stream and a datagram socket, `SO_REUSEADDR` accepted **and** shown not to change a second `bind` (the kernel validates and ignores it), a non-blocking read measured at `WouldBlock`, a 500 ms read deadline enforced by the SDK (the kernel's `SO_RCVTIMEO` reads back zero), `try_clone` sharing one descriptor with the echo read back through the clone, and the UDP receive deadline |
+| `tls_get` | a live HTTPS GET of `example.com` — TLS 1.3 handshake, chain to the committed CA bundle (`anchors=6`), SAN check, clock gate, `CertificateVerify`, 577-byte body — plus four refusals: no clock (`stage=clock`), no entropy (`stage=entropy`), a self-signed chain (`cause=chain`) and a trusted chain for the wrong name (`cause=hostname`) |
 
 ## API surface
 
@@ -382,12 +443,24 @@ lexically before every syscall. No `OsStr`, no `strip_prefix`, no
 ### `pagh_std::collections` and `pagh_std::hash`
 
 Real `alloc` types: `Vec`, `String`, `VecDeque`, `BTreeMap`, `BTreeSet`,
-`BinaryHeap`, plus `Box`, `ToOwned`, `ToString`. `HashMap`/`HashSet` are
-**documented `BTreeMap`/`BTreeSet` shims** (the API is std-shaped; keys need
-`Ord`, iteration is sorted; `capacity` is `len`). `hash` re-exports
-`Hash`/`Hasher`/`BuildHasher` and provides a deterministic FNV-1a
-`RandomState`/`DefaultHasher` — pagh has no entropy source, so “random” would
-be a lie. The `HashMap` shim does not consult the hasher.
+`BinaryHeap`, plus `Box`, `ToOwned`, `ToString`.
+
+`HashMap`/`HashSet` are a **real hash table** (0.7.0; the 0.6.0 `BTreeMap` shim
+is gone): Robin Hood linear probing over a power-of-two bucket array with
+backward-shift deletion (no tombstones) and a 3/4 maximum load factor. Keys
+need `Hash + Eq`, not `Ord`; `capacity()` reports real spare capacity;
+`try_reserve`/`try_reserve_exact` return a `TryReserveError` instead of
+aborting; iteration order is unspecified (bucket order) and changes as the
+table grows, exactly like `std`. The stored hash is mixed with a 64-bit
+finalizer before the low bits are used as a bucket index, so a `Hasher` only
+has to be consistent, not well distributed.
+
+`hash` re-exports `Hash`/`Hasher`/`BuildHasher` and provides a deterministic
+FNV-1a `RandomState`/`DefaultHasher` (the default `HashMap` hasher) — pagh has
+no entropy source, so “randomly seeded” would be a lie, and a map keyed by
+attacker-controlled strings is **not** hash-flooding resistant. The honest
+statement is the documented one: pass a different `BuildHasher` if the keys are
+hostile.
 
 ### `pagh_std::sync`
 
@@ -459,9 +532,11 @@ syscalls, so the SDK can remember what the ABI cannot report (there is no
 
 | Item | Notes |
 |---|---|
-| `TcpStream` | `connect`, `fd`, `peer_addr` (remembered from `connect`/`accept`), `shutdown`, `read_to_end`, `buffered`; `Read`/`Write`/`BufRead` with blocking retry semantics |
-| `TcpListener` | `bind(port)`, `bind_to(address, port)`, `bind_with_backlog`, `fd`, `local_addr`, `accept`, `accept_nonblocking`, `incoming` |
-| `UdpSocket` | `bind(port)`, `bind_to(address, port)`, `fd`, `local_addr`, `set_nonblocking`/`is_nonblocking` (SDK state, `&self`), `send_to`, `recv_from`, `try_recv_from` |
+| `TcpStream` | `connect` (IPv4 literal), `connect_host(host, port)` (DNS), `fd`, `peer_addr` (remembered from `connect`/`accept`), `shutdown`, `read_to_end`, `buffered`, `set_nonblocking`/`is_nonblocking`, `set_read_timeout`/`set_write_timeout` (+ getters), `set_reuseaddr`, `socket_type`, `try_clone`; `Read`/`Write`/`BufRead` with blocking retry semantics |
+| `TcpListener` | `bind(port)`, `bind_to(address, port)`, `bind_with_backlog`, `fd`, `local_addr`, `set_reuseaddr`, `socket_type`, `accept`, `accept_nonblocking`, `incoming` |
+| `UdpSocket` | `bind(port)`, `bind_to(address, port)`, `fd`, `local_addr`, `set_nonblocking`/`is_nonblocking` (SDK state, `&self`), `set_read_timeout`/`read_timeout`, `socket_type`, `send_to`, `recv_from`, `try_recv_from` |
+| `connect("host:port")` | resolve (if it is not a literal) and connect — the `std`-shaped entry point |
+| `dns` | `resolve`, `resolve_all`, `Resolver` (`with_servers`, `system`, `set_port`, `set_timeout`, `set_attempts`), `Error`, `parse_resolv_conf`; `dns_wire` is the pure codec |
 
 `TcpListener` is created `SOCK_NONBLOCK` at the ABI level: `accept()` retries
 the non-blocking accept and yields the CPU between attempts (the std blocking
@@ -479,12 +554,85 @@ block only while ARP resolves the next hop. A datagram larger than the caller's
 buffer is truncated by the kernel; more than 1024 payload bytes is rejected
 before anything is sent.
 
+**Socket options.** `setsockopt`/`getsockopt` exist in the ABI but are a
+validated no-op for everything except the `SO_TYPE`/`SO_ERROR` reads, so the
+SDK splits the two claims: `socket_type()` is a real round trip (`Stream` or
+`Datagram`), `set_reuseaddr(bool)` returns the kernel's own answer *and* the
+docs say what it does not do (a second `bind` of the same port still fails —
+the live transcript shows both halves), and the timeouts are issued to the ABI
+while being **enforced by the SDK**, because the kernel ignores the value
+(`SO_RCVTIMEO` "reads back as zero"). A read or write that passes its deadline
+returns `WouldBlock`, as `std::net::TcpStream::set_read_timeout` documents. A
+kernel that answered `-ENOPROTOOPT` produces a typed `Unsupported` error
+instead.
+
+**Non-blocking mode and `try_clone`.** The ABI has no `fcntl`, and a stream
+`recv` is already non-blocking by contract (`-EAGAIN` when nothing is queued),
+so `set_nonblocking` is SDK policy: `true` turns the first `EAGAIN` into
+`WouldBlock`, `false` yields and retries. `dup` refuses sockets in this kernel
+(a second descriptor for one connection would be a second owner without a
+reference count), so `try_clone` is *shared ownership of one descriptor*, not
+`std`'s descriptor duplication: both handles read and write the same socket and
+the connection closes when the last one drops. The read-ahead buffer and the
+timeout/non-blocking policy are per handle.
+
+**DNS.** The ABI exposes neither a resolver call nor the DHCP lease, so
+`pagh_std::net::dns` speaks RFC 1035 itself over a `UdpSocket`: one `A`
+question, a bounded retry budget, a fail-closed parser (compression pointers
+must point strictly backwards; the reply must echo the transaction id and the
+question), `CNAME` following (four hops), and typed errors (`NameError`,
+`ServerFailure`, `Refused`, `NoRecords`, `Timeout`, `Truncated`, `Malformed`,
+`InvalidName`). The server list comes from, in order: the caller
+(`Resolver::with_servers`), `/etc/resolv.conf` then `/mnt/etc/resolv.conf`
+(BSD convention), or the compiled-in `10.0.2.3` — QEMU's user-network DNS and
+the DHCP option 6 value on the network the live runs use. There is no IPv6, no
+`AAAA`/`MX`/`TXT`, no TCP fallback for a truncated answer, and no cache. The
+transaction id varies but is **not** unpredictable (no entropy source), which
+is stated rather than implied.
+
 The kernel's limits apply: one active-open TCP client at a time (accepted
 server connections and the listener have their own descriptors), one listener
 with a four-entry accept queue (backlog clamped to `1..=4`), eight TCP
 connections, eight bound UDP ports, and sixteen file descriptors per process.
-There is no DNS, IPv6, TLS, `getpeername`, `getsockname`, `fcntl`, socket
-option or half-close in this layer.
+There is no IPv6, no `getpeername`, no `getsockname`, no `fcntl` and no
+half-close in this layer.
+
+### `pagh_std::tls`
+
+TLS 1.3 over a `TcpStream`, built on the **vendored** `embedded-tls` 0.19.0
+(the same crate and the same deliberate local patch the kernel links: upstream
+reached `ApplicationData` even when the server never sent `Certificate`, so the
+vendored state machine refuses `Finished` unless the certificate was received
+*and* verified).
+
+| Item | Notes |
+|---|---|
+| `TlsStream` | `connect(stream, server_name, now_unix, &mut Entropy)`, `read`, `write`, `write_all`, `flush`, `peer_addr`, `server_name`, `verified`, `record_buffers`; `Read`/`Write` |
+| `Entropy` | a ChaCha20 CSPRNG over a caller-supplied 32-byte seed (`from_seed`, `from_hex`) |
+| `https_get` / `https_get_at` | one authenticated `GET`, returning the decoded body (`Content-Length` or chunked) |
+| `Verified` | what the handshake proved: leaf SHA-256 fingerprint, chain length, anchor count, the clock used |
+
+Every handshake is refused unless the chain validates against the committed
+`ca_bundle` (6 curated roots: ISRG X1/X2, GTS R1/R4, SSL.com ECC/RSA 2022), the
+leaf's SAN entries authorize `server_name` (RFC 6125, **no** CN fallback), the
+caller's clock is at or above `CLOCK_FLOOR` (2025-01-01), the
+`CertificateVerify` signature checks out, **and** a certificate was actually
+verified during that handshake (a post-handshake gate independent of the state
+machine). Refusals print the gate that refused — `tls: verify FAILED cause=…`
+with `chain`, `hostname`, `no-hostname`, `leaf-key`, `clock`,
+`signature-scheme` or `signature` — and successes print the leaf fingerprint,
+the chain length and the anchors, so the transcript can be cross-checked
+against `openssl s_client` on the host.
+
+**The two inputs the ABI cannot supply.** `clock_gettime(CLOCK_REALTIME)` on
+this kernel is the uptime counter (both clock ids map to `timer::uptime_ms()`),
+and there is no RTC syscall; there is also no `getrandom`, no `/dev/urandom`
+and no entropy syscall (the kernel's own pool is seeded from
+`/chosen/rng-seed`, which userland cannot reach). A TLS client that invented
+either would be a facade, so `TlsStream::connect` **requires** `now_unix` and a
+32-byte seed from the caller: no clock below the floor, and no entropy, means
+no handshake. The live acceptance run supplies both from the host harness (real
+Unix seconds and a staged `/mnt/seed`), and the transcript says so.
 
 ### `pagh_std::fmt`, `panic`, `ffi`
 
@@ -539,18 +687,34 @@ Impossible without new kernel syscalls (shown with the SDK's typed
   socket fd is `ENOTSUP` (one TCP connection), and there is no `SIGCHLD`;
   `Command::current_dir` is not applied (no `chdir` syscall); signals are in
   `pagh_std::signal`;
-- **networking limits**: IPv4 literals only (no DNS), one active-open TCP
-  client at a time, one listener with a four-entry accept queue, eight TCP
-  connections and eight bound UDP ports; no `getsockname`/`getpeername`
-  (`local_addr`/`peer_addr` are the SDK's record of the call), no `fcntl`, so a
-  `TcpStream` cannot be switched to non-blocking and has no `try_clone`, no
-  socket options/`SO_REUSEADDR`, no half-close, and no way to learn an
-  ephemeral port. `libpagh`'s frozen errno table has no `EADDRINUSE`,
-  `EADDRNOTAVAIL` or `EMSGSIZE`, so a bind conflict, a non-local bind address
-  and an oversized datagram arrive as `ErrorKind::Uncategorized` with the
-  message `Unknown error (outside the pagh ABI)` — the kernel did report the
-  specific errno, and the SDK cannot see it. TLS exists in the kernel's own
-  stack (and in `apt`), not in this SDK;
+- **networking limits**: one active-open TCP client at a time, one listener
+  with a four-entry accept queue, eight TCP connections and eight bound UDP
+  ports; no `getsockname`/`getpeername` (`local_addr`/`peer_addr` are the SDK's
+  record of the call), no half-close, and no way to learn an ephemeral port.
+  `libpagh`'s frozen errno table has no `EADDRINUSE`, `EADDRNOTAVAIL` or
+  `EMSGSIZE`, so a bind conflict, a non-local bind address and an oversized
+  datagram arrive as `ErrorKind::Uncategorized` with the message
+  `Unknown error (outside the pagh ABI)` — the kernel did report the specific
+  errno, and the SDK cannot see it. `SO_REUSEADDR` is accepted by the kernel and
+  has no effect (ports are reserved at `bind`); the SDK's timeouts are enforced
+  by the SDK. `try_clone` shares one descriptor because the ABI refuses `dup`
+  on a socket. IPv6 does not exist here;
+- **DNS**: `pagh_std::net::dns` is a stub resolver, not a system resolver: it
+  has no IPv6/`AAAA`, no `MX`/`TXT`/`SRV`, no TCP fallback for a truncated
+  answer, no cache, no `search`/`ndots` processing, and a transaction id that
+  varies but is not unpredictable (no entropy source). The ABI cannot report the
+  DHCP lease, so the server list comes from a configuration file or the
+  compiled-in `10.0.2.3` (documented, and the live run proves the value is the
+  leased one);
+- **TLS**: the SDK's TLS needs two inputs the ABI cannot supply — a wall clock
+  (`CLOCK_REALTIME` is uptime here, and there is no RTC syscall) and 32 bytes of
+  entropy (no `getrandom`, no `/dev/urandom`; the kernel's `/chosen/rng-seed`
+  pool is not reachable from userland). `TlsStream::connect` therefore takes
+  `now_unix` and an `Entropy` seed from the caller and refuses without them;
+  closing this properly needs a kernel change. Also absent: client certificates
+  (`mTLS`), session resumption, `close_notify` on drop, RSA-PSS *certificate*
+  signatures (the TLS 1.3 `CertificateVerify` PSS schemes are supported),
+  `no_std`-style PSK handshakes, and any TLS version below 1.3;
 - **`mpsc` is bounded**: `channel()` holds 32 values and `sync_channel(0)` is
   clamped to 1; there is no unbounded channel and no zero-capacity rendezvous;
 - **`Barrier`/`Once` deviations**: `Barrier::new(0)` waits for nobody and
@@ -584,9 +748,9 @@ Impossible without new kernel syscalls (shown with the SDK's typed
 Also deliberately not provided in this first version: `io::Cursor`,
 `Read::chain`, `Tee`, file locking, `is_terminal`, `Path::starts_with` /
 `strip_prefix` / `ancestors`, `OsString`, `Rc`/`Arc` re-exports, `OnceLock`,
-and a real hash table. They are userland-only conveniences the SDK can grow
-without a kernel change; the current surface is the part exercised by the live
-transcript.
+`Path::starts_with`/`strip_prefix`/`ancestors`, and raw-entry/nightly hash-map
+APIs. They are userland-only conveniences the SDK can grow without a kernel
+change; the current surface is the part exercised by the live transcript.
 
 ## Design notes
 
@@ -636,13 +800,20 @@ The transcript covers:
 | UDP sockets | 0.6.0 transcript: `bind`/`local_addr`, `set_nonblocking` → `WouldBlock`, 16- and 300-byte datagrams round-tripped through a host echo server, 1025-byte send rejected |
 | mpsc | 0.6.0 transcript: 12 values through a 2-slot channel with blocking `send`, `try_send` Full/Disconnected, `try_recv` Empty, `recv` after disconnect, `recv_timeout` Disconnected |
 | Barrier / Once | 0.6.0 transcript: 4 parties × 2 generations with exactly one leader each, and 4 threads racing one `Once` (one run, all saw `is_completed`) |
+| `HashMap`/`HashSet` | 0.7.0 transcript: a `Hash + Eq` key with no `Ord`, 1000 inserts → `len=1000 capacity=1536`, 500 removals with the other 500 still reachable, 64 keys forced into one bucket then a middle deletion, `entry`/`retain`/`extend`/`FromIterator`/`Index`, set algebra |
+| DNS | 0.7.0 transcript: `/mnt/etc/resolv.conf` names the DHCP-leased server (the boot log's `dns 10.0.2.3`), a real `A` query with the server's TTLs, `NXDOMAIN`, `InvalidName` before any datagram, a 1 s deadline against a host black hole, and `connect("example.com:80")` → `HTTP/1.1 200 OK` |
+| socket options | 0.7.0 transcript: `SO_TYPE` → `Stream`/`Datagram`, `SO_REUSEADDR` accepted and the second `bind` still refused, non-blocking read `WouldBlock`, 500 ms read deadline and 300 ms UDP deadline enforced by the SDK, `try_clone` echo read back through the clone and the original still usable after it drops |
+| TLS 1.3 | 0.7.0 transcript: a live `https://example.com/` GET — chain to the committed bundle (`chain=4 anchors=6`), leaf `sha256:85ca6ab0…`, `CertificateVerify OK`, 577-byte body — and four refusals: `stage=clock`, `stage=entropy`, `cause=chain` (self-signed `openssl s_server`) and `cause=hostname` (a trusted Google chain for `example.com`) |
 
 `python3 tools/live_check.py` reproduces the 0.4.0 matrix;
 `docs/live-rust-sdk.txt` is that captured run. `docs/live-sdk-0.5.0.txt` is the
 focused 0.5.0 run with its kernel/QEMU/toolchain header. `python3
 tools/live_net.py` reproduces the 0.6.0 network/sync matrix in one boot and
 rewrites `docs/live-sdk-0.6.0.txt` (47/47 checks, kernel hash and ELF hashes
-included).
+included). `python3 tools/live_070.py` reproduces the 0.7.0 matrix in one boot
+and rewrites `docs/live-sdk-0.7.0.txt` (**55/55 checks**, kernel and ELF
+hashes included); the host unit tests are 34 checks
+(`cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`).
 
 ## CI
 
