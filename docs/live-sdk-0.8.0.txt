@@ -1,7 +1,7 @@
 pagh-rust 0.8.0 — live QEMU acceptance transcript (kernel-backed TLS)
 ==============================================================================
 
-date:               2026-11-09 19:25:37 +0300
+date:               2026-11-09 19:28:13 +0300
 kernel:             /home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/release/pagh sha256 d569aef920e9af80552295203dcd5120efc736bd643fe5b13db3b8db9f8c848f
 kernel launcher:    pagh-riscv/tools/run.py --net --keep (guest 10.0.2.15/24)
 guest image:        `mke2fs -q -t ext2 -F -b 4096 -d <rootfs>`
@@ -12,12 +12,12 @@ release ELF:        tls_get_vendored sha256 109cc19ac4e5041e816cb21017d897c60358
 
 guest address:      10.0.2.15 (DHCP, from the boot log)
 DHCP DNS server:    10.0.2.3 (the value staged in resolv.conf)
-kernel clock:       rtc         goldfish @ 0x101000 - 2026-11-09 16:25:37 UTC
+kernel clock:       rtc         goldfish @ 0x101000 - 2026-11-09 16:28:13 UTC
 kernel entropy:     entropy     32 bytes from /chosen/rng-seed - TLS session keys available
-host TLS server:    openssl s_server (self-signed example.com) on 10.0.2.2:48429
+host TLS server:    openssl s_server (self-signed example.com) on 10.0.2.2:46027
 TLS proof host:     https://example.com/ (chain -> a kernel bundle anchor)
-SAN-negative host:  www.google.com (142.251.157.119) — trusted chain, wrong name
-clock and entropy:  supplied by the KERNEL (RTC + /chosen/rng-seed) for tls_get; the vendored program is given the host's clock (1794241539) and takes its seed from getrandom
+SAN-negative host:  www.google.com (142.251.156.119) — trusted chain, wrong name
+clock and entropy:  supplied by the KERNEL (RTC + /chosen/rng-seed) for tls_get; the vendored program is given the host's clock (1794241696) and takes its seed from getrandom
 
 checks:             32 passed, 0 failed
   PASS  boot log: DHCP ip 10.0.2.15 gw 10.0.2.2 dns 10.0.2.3
@@ -38,20 +38,20 @@ checks:             32 passed, 0 failed
   PASS  `run /mnt/tls_get --manual` printed 'mode=manual'
   PASS  `run /mnt/tls_get --manual` printed 'tls_get: host=example.com port=443 path=/'
   PASS  `run /mnt/tls_get --manual` printed 'tls_get: status 200 body '
-  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241539 kernel` -> TLS_GET PASS
-  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241539 kernel` printed 'tls_get_vendored: entropy = getrandom(278) -> ChaCha20'
-  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241539 kernel` printed 'tls: verified leaf=sha256:'
-  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241539 kernel` printed 'tls: CertificateVerify OK'
-  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241539 kernel` printed 'tls: handshake OK'
-  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241539 kernel` printed 'tls: fetch OK'
-  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241539 kernel` printed 'Example Domain'
-  PASS  `run /mnt/tls_get https://example.com:48429/ --ip=10.0.2.2` -> TLS_GET FAIL
-  PASS  `run /mnt/tls_get https://example.com:48429/ --ip=10.0.2.2` printed 'tls: verify FAILED cause=chain'
-  PASS  `run /mnt/tls_get https://example.com:48429/ --ip=10.0.2.2` printed 'tls: FAILED stage=handshake host=example.com'
-  PASS  `run /mnt/tls_get https://example.com:48429/ --ip=10.0.2.2` printed '(errno 129)'
-  PASS  `run /mnt/tls_get https://example.com/ --ip=142.251.157.119` -> TLS_GET FAIL
-  PASS  `run /mnt/tls_get https://example.com/ --ip=142.251.157.119` printed 'tls: verify FAILED cause=hostname'
-  PASS  `run /mnt/tls_get https://example.com/ --ip=142.251.157.119` printed '(errno 129)'
+  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241696 kernel` -> TLS_GET PASS
+  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241696 kernel` printed 'tls_get_vendored: entropy = getrandom(278) -> ChaCha20'
+  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241696 kernel` printed 'tls: verified leaf=sha256:'
+  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241696 kernel` printed 'tls: CertificateVerify OK'
+  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241696 kernel` printed 'tls: handshake OK'
+  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241696 kernel` printed 'tls: fetch OK'
+  PASS  `run /mnt/tls_get_vendored https://example.com/ 1794241696 kernel` printed 'Example Domain'
+  PASS  `run /mnt/tls_get https://example.com:46027/ --ip=10.0.2.2` -> TLS_GET FAIL
+  PASS  `run /mnt/tls_get https://example.com:46027/ --ip=10.0.2.2` printed 'tls: verify FAILED cause=chain'
+  PASS  `run /mnt/tls_get https://example.com:46027/ --ip=10.0.2.2` printed 'tls: FAILED stage=handshake host=example.com'
+  PASS  `run /mnt/tls_get https://example.com:46027/ --ip=10.0.2.2` printed '(errno 129)'
+  PASS  `run /mnt/tls_get https://example.com/ --ip=142.251.156.119` -> TLS_GET FAIL
+  PASS  `run /mnt/tls_get https://example.com/ --ip=142.251.156.119` printed 'tls: verify FAILED cause=hostname'
+  PASS  `run /mnt/tls_get https://example.com/ --ip=142.251.156.119` printed '(errno 129)'
 
 The transcript below is the shell session from the first command the driver
 typed to the last (the boot banner is not replayed on reconnect); CRLF is
@@ -63,9 +63,9 @@ run /mnt/tls_get
 tls_get: url=https://example.com/ pinned=None mode=https_get
 tls: https_get host=example.com port=443 path=/
 [stack] tls user_open future = 1320 bytes
-tls: verified leaf=sha256:85ca6ab068e9bcce88b6c4aa3c47f7d17228134a457f870d3800e6223a0df07a chain=4 certs anchors=6 host=example.com now=1794241540
+tls: verified leaf=sha256:85ca6ab068e9bcce88b6c4aa3c47f7d17228134a457f870d3800e6223a0df07a chain=4 certs anchors=6 host=example.com now=1794241696
 tls: CertificateVerify OK (server proved possession of the leaf key)
-tls: user session 0 open tcp=0 host=example.com (TLS 1.3, AES-128-GCM-SHA256, server authenticated, 110 ms)
+tls: user session 0 open tcp=0 host=example.com (TLS 1.3, AES-128-GCM-SHA256, server authenticated, 100 ms)
 tls: session up host=example.com peer=8.47.69.0:443 (kernel handshake, certificate verified)
 [stack] tls write future = 256 bytes
 [stack] tls read future = 424 bytes
@@ -80,10 +80,10 @@ pagh:rv64> run /mnt/tls_get --manual
 tls_get: url=https://example.com/ pinned=None mode=manual
 tls_get: host=example.com port=443 path=/
 [stack] tls user_open future = 1320 bytes
-tls: verified leaf=sha256:85ca6ab068e9bcce88b6c4aa3c47f7d17228134a457f870d3800e6223a0df07a chain=4 certs anchors=6 host=example.com now=1794241541
+tls: verified leaf=sha256:85ca6ab068e9bcce88b6c4aa3c47f7d17228134a457f870d3800e6223a0df07a chain=4 certs anchors=6 host=example.com now=1794241697
 tls: CertificateVerify OK (server proved possession of the leaf key)
-tls: user session 0 open tcp=0 host=example.com (TLS 1.3, AES-128-GCM-SHA256, server authenticated, 80 ms)
-tls: session up host=example.com peer=8.47.69.0:443 (kernel handshake, certificate verified)
+tls: user session 0 open tcp=0 host=example.com (TLS 1.3, AES-128-GCM-SHA256, server authenticated, 70 ms)
+tls: session up host=example.com peer=8.6.112.0:443 (kernel handshake, certificate verified)
 [stack] tls write future = 256 bytes
 [stack] tls read future = 424 bytes
 tls: response 200, transfer-encoding chunked, body starts at 342
@@ -92,44 +92,44 @@ tls_get: status 200 body 577 bytes
 tls_get: first body line: <!doctype html><html lang=en><head><meta charset=utf-8><link rel=icon href=data:,><meta name=viewport content="width=device-width,initial-scale=1"><title>Example Domain</title><style>html{color-scheme:light dark;background:light-dark(#eee,#222)}body{font:16px/1.6 system-ui,sans-serif;max-width:26em;margin:auto;padding:25vh 2em 2em;text-align:center}</style></head><body><p>This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.</p><script src=/s.js></script></body></html>
 TLS_GET PASS
 run: /mnt/tls_get exited with code 0
-pagh:rv64> run /mnt/tls_get_vendored https://example.com/ 1794241539 kernel
+pagh:rv64> run /mnt/tls_get_vendored https://example.com/ 1794241696 kernel
 tls_get_vendored: entropy = getrandom(278) -> ChaCha20
-tls_get_vendored: url=https://example.com/ host=example.com port=443 path=/ now=1794241539 pinned=None
+tls_get_vendored: url=https://example.com/ host=example.com port=443 path=/ now=1794241696 pinned=None
 tls: fetch host=example.com port=443 path=/
 tls: resolve example.com -> 8.47.69.0
 tls: tcp connected to 8.47.69.0:443
 tls: CA bundle 6 roots (0 unparsable), server_name=example.com
-tls: verified leaf=sha256:85ca6ab068e9bcce88b6c4aa3c47f7d17228134a457f870d3800e6223a0df07a chain=4 anchors=6 host=example.com now=1794241539
+tls: verified leaf=sha256:85ca6ab068e9bcce88b6c4aa3c47f7d17228134a457f870d3800e6223a0df07a chain=4 anchors=6 host=example.com now=1794241696
 tls: CertificateVerify OK (server proved possession of the leaf key)
 tls: handshake OK (TLS 1.3, AES-128-GCM-SHA256, server authenticated)
 tls: read 926 bytes (total 926)
 tls: response 200, transfer-encoding chunked, body starts at 342
 tls: read 5 bytes (total 931)
-tls: fetch OK body=577 bytes in 260 ms
+tls: fetch OK body=577 bytes in 220 ms
 tls_get_vendored: body 577 bytes, first line: <!doctype html><html lang=en><head><meta charset=utf-8><link rel=icon href=data:,><meta name=viewport content="width=device-width,initial-scale=1"><title>Example Domain</title><style>html{color-scheme:light dark;background:light-dark(#eee,#222)}body{font:16px/1.6 system-ui,sans-serif;max-width:26em;margin:auto;padding:25vh 2em 2em;text-align:center}</style></head><body><p>This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.</p><script src=/s.js></script></body></html>
 TLS_GET PASS
 run: /mnt/tls_get_vendored exited with code 0
-pagh:rv64> run /mnt/tls_get https://example.com:48429/ --ip=10.0.2.2
-tls_get: url=https://example.com:48429/ pinned=Some(Ipv4([10, 0, 2, 2])) mode=https_get
-tls: https_get host=example.com port=48429 path=/
+pagh:rv64> run /mnt/tls_get https://example.com:46027/ --ip=10.0.2.2
+tls_get: url=https://example.com:46027/ pinned=Some(Ipv4([10, 0, 2, 2])) mode=https_get
+tls: https_get host=example.com port=46027 path=/
 tls: address pinned by the caller -> 10.0.2.2
 [stack] tls user_open future = 1320 bytes
 tls: verify FAILED cause=chain (NoAnchor) - the server chain does not validate against the committed CA bundle
 tls: user session host=example.com FAILED stage=handshake (InvalidCertificate)
 tls: user session host=example.com refused (Certificate)
-tls: FAILED stage=handshake host=example.com peer=10.0.2.2:48429 cause=Certificate rejected by the trust decision (errno 129)
+tls: FAILED stage=handshake host=example.com peer=10.0.2.2:46027 cause=Certificate rejected by the trust decision (errno 129)
 tls_get: FAIL Certificate rejected by the trust decision (errno 129)
 TLS_GET FAIL
 run: /mnt/tls_get exited with code 1
-pagh:rv64> run /mnt/tls_get https://example.com/ --ip=142.251.157.119
-tls_get: url=https://example.com/ pinned=Some(Ipv4([142, 251, 157, 119])) mode=https_get
+pagh:rv64> run /mnt/tls_get https://example.com/ --ip=142.251.156.119
+tls_get: url=https://example.com/ pinned=Some(Ipv4([142, 251, 156, 119])) mode=https_get
 tls: https_get host=example.com port=443 path=/
-tls: address pinned by the caller -> 142.251.157.119
+tls: address pinned by the caller -> 142.251.156.119
 [stack] tls user_open future = 1320 bytes
 tls: verify FAILED cause=hostname (the certificate does not authorize "example.com" through its SAN entries)
 tls: user session host=example.com FAILED stage=handshake (InvalidCertificate)
 tls: user session host=example.com refused (Certificate)
-tls: FAILED stage=handshake host=example.com peer=142.251.157.119:443 cause=Certificate rejected by the trust decision (errno 129)
+tls: FAILED stage=handshake host=example.com peer=142.251.156.119:443 cause=Certificate rejected by the trust decision (errno 129)
 tls_get: FAIL Certificate rejected by the trust decision (errno 129)
 TLS_GET FAIL
 run: /mnt/tls_get exited with code 1

@@ -200,7 +200,7 @@ Outputs (the kernel refuses images above 1 MiB — `run_file_with_argv0` checks
 the size before mapping anything):
 
 ```text
-target/riscv64gc-unknown-none-elf/debug/examples/cat … sync_primitives   (~178–300 KiB)
+target/riscv64gc-unknown-none-elf/debug/examples/cat … sync_primitives   (160–240 KiB)
 target/riscv64gc-unknown-none-elf/debug/examples/hash_map                194 KiB
 target/riscv64gc-unknown-none-elf/debug/examples/dns                     301 KiB
 target/riscv64gc-unknown-none-elf/debug/examples/socket_opts             261 KiB
@@ -212,7 +212,7 @@ target/riscv64gc-unknown-none-elf/release/examples/tls_get_vendored      760 KiB
 TLS stack at all — the handshake is the kernel's — so its debug image is
 284 KiB and CI gates it with every other default example.
 `tls_get_vendored` links the vendored `embedded-tls` and the verify-only crypto
-backends (RSA, P-256/P-384, Ed25519), whose *debug* build is 1.19 MiB — over
+backends (RSA, P-256/P-384, Ed25519), whose *debug* build is 1.16 MiB — over
 the kernel's limit — and 760 KiB in release, which is the profile
 `tools/live_070.py` uses. The two paths are sized in one CI step.
 

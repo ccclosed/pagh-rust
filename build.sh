@@ -124,7 +124,7 @@ done
 if [ "$BUILD_VENDORED" -eq 1 ]; then
     # Every example is one ELF at a time: the kernel loads one image per `run`,
     # so only the program that was asked for has to fit — and in the debug
-    # profile this one does not (1.19 MiB), which is why it is release-only.
+    # profile this one does not (1.16 MiB), which is why it is release-only.
     name=tls_get_vendored
     path="$EXAMPLE_DIR/$name"
     if [ ! -f "$path" ]; then

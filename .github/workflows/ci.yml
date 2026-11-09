@@ -66,7 +66,7 @@ jobs:
       - name: Check the kernel 1 MiB image limit
         working-directory: pagh-rust
         # Every example that a default build produces, including 0.8.0's
-        # kernel-backed `tls_get` (290 KiB debug — it links no TLS stack at all).
+        # kernel-backed `tls_get` (284 KiB debug — it links no TLS stack at all).
         run: |
           set -euo pipefail
           for elf in cat wc find threads_mutex spawn condvar io_traits tcp_server udp_echo \
@@ -81,7 +81,7 @@ jobs:
         working-directory: pagh-rust
         # The 0.7.0 userland implementation is off by default and stays
         # release-only: `tls_get_vendored` links the vendored embedded-tls and
-        # crypto backends, and its debug image is 1.19 MiB, over the kernel's
+        # crypto backends, and its debug image is 1.16 MiB, over the kernel's
         # limit. Its live matrix (`tools/live_070.py`) runs release for the same
         # reason. `tls_get` is in the list too, so the two paths are sized in
         # one place.

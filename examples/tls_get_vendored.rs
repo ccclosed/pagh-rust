@@ -4,8 +4,8 @@
 //! **Build it with `./build.sh --release --vendored`.** The default `tls_get`
 //! (0.8.0) uses the kernel's TLS client and needs no feature; this one links
 //! the vendored `embedded-tls` stack and its crypto backends, so the debug
-//! profile comes out at 1.19 MiB — over the kernel's 1 MiB image limit — and
-//! release is the profile that fits (≈772 KiB).
+//! profile comes out at 1.16 MiB — over the kernel's 1 MiB image limit — and
+//! release is the profile that fits (760 KiB).
 //!
 //! Everything here runs in the process: the handshake, the chain walk and the
 //! SAN check. That is why the caller still has to supply the wall clock (the
