@@ -44,8 +44,7 @@ fn duration_nanos(duration: Duration) -> u64 {
 ///
 /// The kernel validates the `Timespec`, rounds **up** to its 10 ms tick and
 /// waits with interrupts enabled. This is the only blocking primitive the ABI
-/// offers; there is no `poll`, so there is no standard way to wait for a
-/// descriptor.
+/// offers for a plain sleep; there is no `poll` wrapper in this SDK yet.
 pub fn sleep(duration: Duration) -> Result<()> {
     let nanos = duration.as_nanos();
     let seconds = nanos / 1_000_000_000;
@@ -59,6 +58,27 @@ pub fn sleep(duration: Duration) -> Result<()> {
     };
     sys::nanosleep(&request)?;
     Ok(())
+}
+
+/// Sleep until `deadline`, or return immediately if it has passed.
+///
+/// The remaining duration is measured with [`Instant::now`] at call time and
+/// then handed to [`sleep`], so the usual loop shape is:
+///
+/// ```ignore
+/// while !ready && Instant::now() < deadline {
+///     sleep_until(deadline);
+/// }
+/// ```
+///
+/// Because the kernel rounds a sleep up to its 10 ms tick, this is a deadline
+/// with tick granularity, not a real-time guarantee.
+pub fn sleep_until(deadline: Instant) -> Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(());
+    }
+    sleep(remaining)
 }
 
 /// A monotonic instant (`CLOCK_MONOTONIC`, 10 ms kernel resolution).
@@ -100,6 +120,19 @@ impl Instant {
     /// Time elapsed since this instant (saturating).
     pub fn elapsed(self) -> Duration {
         Instant::now().saturating_duration_since(self)
+    }
+
+    /// Milliseconds elapsed since this instant, truncated (saturating).
+    ///
+    /// A convenience for log lines: the kernel's resolution is 10 ms, so the
+    /// last digit is always a multiple of 10.
+    pub fn elapsed_millis(self) -> u64 {
+        self.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
+    /// Sleep until this instant (see the free [`sleep_until`]).
+    pub fn sleep_until(self) -> Result<()> {
+        sleep_until(self)
     }
 
     /// Time elapsed since `earlier` (saturating; zero if `earlier` is later).

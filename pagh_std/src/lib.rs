@@ -13,11 +13,12 @@
 //! `pagh_std` therefore does not claim to be `std`. It claims something
 //! narrower and testable: file I/O, directories, arguments/environment,
 //! monotonic time, paths, buffered I/O, formatting, exit codes, **native
-//! threads/futexes and scoped threads** ([`thread`]), **mutexes, rwlocks and
-//! condition variables** ([`sync`]), a connected TCP client ([`net`]) and
-//! **signals** ([`signal`]). Operations the ABI cannot express (`fsync`,
-//! `O_EXCL`, `dup`, `OsStr`, dynamic linking) remain typed `Unsupported`
-//! errors instead of silent stubs.
+//! threads/futexes and scoped threads** ([`thread`]), **mutexes, rwlocks,
+//! condition variables, a bounded channel, barriers and `Once`** ([`sync`]),
+//! the ABI's IPv4 sockets — **a TCP client, a TCP listener and UDP
+//! datagrams** ([`net`]) — and **signals** ([`signal`]). Operations the ABI
+//! cannot express (`fsync`, `O_EXCL`, `dup`, `OsStr`, dynamic linking) remain
+//! typed `Unsupported` errors instead of silent stubs.
 //!
 //! # Program shape
 //!
@@ -54,7 +55,10 @@
 //! * console `read(0)` is non-blocking and has no EOF (the `io::Stdin` handle
 //!   hides the non-blocking part by yielding, but EOF never arrives);
 //! * no `statat`, `O_EXCL`, `O_DIRECTORY`, `O_NOFOLLOW`, `fsync`, `dup`,
-//!   RTC or dynamic linker; one connected TCP client at a time and no listener.
+//!   RTC or dynamic linker;
+//! * IPv4 only (no DNS/TLS in this layer): one active-open TCP client at a
+//!   time, one listener with a four-entry accept queue, eight TCP connections
+//!   and eight bound UDP ports, and a 1024-byte UDP datagram ceiling.
 //!
 //! # Modules
 //!
@@ -64,12 +68,12 @@
 //! | [`fs`] | `File`, `OpenOptions`, `ReadDir`/`Dir`, `DirEntry`, `FileType`, `Metadata`, read/write/copy, mkdir/remove/rename/link/symlink/readlink, lexical `canonicalize` |
 //! | [`env`] | `args`, `args_os` (lossy), `vars`, `var`, `current_dir`, `set_current_dir` (process-local), `temp_dir` |
 //! | [`process`] | `exit`, `abort`, `id`, `fork`/`execve`/`wait`, `Command` spawn/status/output |
-//! | [`time`] | `Duration`, monotonic `Instant`, uptime-based `SystemTime`, `UNIX_EPOCH`, `sleep` |
+//! | [`time`] | `Duration`, monotonic `Instant`, uptime-based `SystemTime`, `UNIX_EPOCH`, `sleep`, `sleep_until` |
 //! | [`path`] | `Path`, `PathBuf`, `Component`, `Components`, lexical `normalize`/`normalize_join` |
 //! | [`collections`] | `Vec`, `String`, `VecDeque`, `BTreeMap`, `BTreeSet`, `BinaryHeap`, `HashMap`/`HashSet` shims |
-//! | [`sync`] | `Cell`, `RefCell`, `OnceCell`, `LazyLock`, futex-backed `Mutex`/`RwLock`/`Condvar` |
+//! | [`sync`] | `Cell`, `RefCell`, `OnceCell`, `LazyLock`, futex-backed `Mutex`/`RwLock`/`Condvar`/`Barrier`/`Once`, bounded `mpsc` |
 //! | [`thread`] | native `Builder`/`JoinHandle`, futex wait/wake, `thread::scope` with borrowed closures |
-//! | [`net`] | `Ipv4`, a connected `TcpStream` with blocking `Read`/`Write`/`BufRead` |
+//! | [`net`] | `Ipv4`, `SocketAddr`, `TcpStream` (blocking `Read`/`Write`/`BufRead`), `TcpListener`, `UdpSocket` |
 //! | [`fmt`] | `core::fmt` re-exports; `print!`, `println!`, `eprint!`, `eprintln!`, `dbg!`, `format!`, `vec!`, `write!`, `writeln!` |
 //! | [`panic`] | `PanicInfo`, `abort`; the handler contract and why `libpagh` owns it |
 //! | [`ffi`] | `c_*` types and `CStr`/`CString` for a future C boundary |

@@ -1,0 +1,156 @@
+pagh-rust — live SDK verification for 0.6.0
+===========================================
+date (UTC):         2026-11-09T13:15:40Z
+crate:              pagh_std 0.6.0
+source state:       git 7f019f729de39cc9af055e9a8fec2536d7eeee16 (working tree dirty)
+toolchain:          rustc 1.99.0-nightly (be8e82435 2026-07-11)
+target:             riscv64gc-unknown-none-elf
+kernel package:     pagh-riscv 0.19.0 (the kernel tree was not modified)
+kernel:             /home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh
+                    sha256 6b96b20735cb3fe449ce1382127060dade48e71610fec279fabc584cc07a5828
+qemu:               QEMU emulator version 10.2.2 (qemu-10.2.2-1.fc44)
+image:              64 MiB ext2: `truncate -s 64M` + `mke2fs -q -t ext2 -F -b 4096 -d <rootfs>`
+                    staging root: cat, condvar, io_traits, sync_primitives, tcp_server, udp_echo, hello.txt
+build:              ./build.sh --release (release profile, strip debuginfo)
+release ELF:        cat sha256 6c829307601ed363b32235d9694313d5e9d53e6eb5bcb4865befdf2af289e44f
+release ELF:        condvar sha256 b7b538da609a731345a60586bd464ad3bf4456a5e908ad6e747293db5e314f86
+release ELF:        io_traits sha256 d9d38dfa10866365df523698171e830d0ea3d8c7ddd834c72e907bb1cbb9337b
+release ELF:        sync_primitives sha256 a5c2ab727c4495a5838c87de481b5daf0401b40c989e81d9033645f1add3d711
+release ELF:        tcp_server sha256 7292244298718eb55855d0cc0f21788d6e9fba2d0cc7103c279cf2f966877cd5
+release ELF:        udp_echo sha256 f506f3320a27c0d4162b4ac953135389bee2eedd3f65a27aca907471d7cab0f5
+boot:               pagh-riscv/tools/run.py --net --hostfwd 127.0.0.1:37243->guest:45679 --keep
+guest driver:       tools/live_net.py reconnects to the serial socket and types one
+                    command at a time (the shell's UART ring is 16 bytes deep)
+host peers:         UDP echo server on 127.0.0.1:<ephemeral>, which the guest reaches
+                    as 10.0.2.2:47986
+                    io_traits TCP server, which the guest reaches as 10.0.2.2:34139
+                    tcp_server client on 127.0.0.1:37243 (two connections)
+
+checks:             47 passed, 0 failed
+  PASS  cat printed the staged file
+  PASS  condvar PASS (0.5.0 regression)
+  PASS  sync_primitives PASS
+  PASS  mpsc: 12 values passed through 2 slots (send blocked)
+  PASS  mpsc: recv after the last sender -> RecvError
+  PASS  mpsc: try_recv on an empty live channel -> Empty
+  PASS  mpsc: try_send on a full channel -> Full (value returned)
+  PASS  mpsc: try_send after the receiver dropped -> Disconnected
+  PASS  mpsc: recv_timeout with no sender -> Disconnected
+  PASS  barrier: every party released, exactly one leader per generation
+  PASS  once: exactly one run, all 4 callers saw is_completed()
+  PASS  udp_echo PASS
+  PASS  udp_echo: bind 0.0.0.0:45680
+  PASS  udp_echo: local_addr 0.0.0.0:45680
+  PASS  udp_echo: set_nonblocking(true); recv_from -> WouldBlock (queue empty)
+  PASS  udp_echo: set_nonblocking(false) restored the blocking mode
+  PASS  udp_echo: datagram 1: verified (16 bytes round-tripped)
+  PASS  udp_echo: datagram 2: verified (300 bytes round-tripped)
+  PASS  udp_echo: oversized send (1024 + 1 bytes) rejected:
+  PASS  udp_echo: SocketAddr parse/display round-trip ok
+  PASS  the host UDP server finished
+  PASS  host UDP server error: None
+  PASS  the host UDP server received the two expected datagrams ([16, 300] bytes)
+  PASS  io_traits PASS (file + TcpStream)
+  PASS  io_traits: TcpStream traits reported ok
+  PASS  the host io_traits server finished
+  PASS  host io_traits server error: None
+  PASS  the host io_traits server read b'PING\n'
+  PASS  tcp_server: TCP_SERVER PASS
+  PASS  tcp_server: tcp_server: bind 0.0.0.0:45679 backlog 4
+  PASS  tcp_server: tcp_server: local_addr 0.0.0.0:45679
+  PASS  tcp_server: tcp_server: accept_nonblocking -> WouldBlock (nothing queued yet)
+  PASS  tcp_server: tcp_server: accept 1 from 10.0.2.2:
+  PASS  tcp_server: tcp_server: accept 2 from 10.0.2.2:
+  PASS  tcp_server: tcp_server: connection 1: peer_addr 10.0.2.2:
+  PASS  tcp_server: tcp_server: connection 2: peer_addr 10.0.2.2:
+  PASS  tcp_server: tcp_server: connection 1: recv 224 bytes
+  PASS  tcp_server: tcp_server: connection 1: echo 224 bytes
+  PASS  tcp_server: tcp_server: connection 2: recv 400 bytes
+  PASS  tcp_server: tcp_server: connection 2: echo 400 bytes
+  PASS  tcp_server: tcp_server: connection 1: peer closed (EOF)
+  PASS  tcp_server: tcp_server: connection 2: peer closed (EOF)
+  PASS  tcp_server: tcp_server: ephemeral bind: local_addr -> TcpListener::local_addr: binds port 0 and the ABI has no getsockname
+  PASS  tcp_server: TCP_SERVER PASS (2 connection(s) echoed)
+  PASS  the host TCP client finished
+  PASS  host TCP client error: None
+  PASS  the host TCP client read back both payloads ([224, 400] bytes)
+
+The transcript below is the complete shell session from the first prompt; the
+OpenSBI/kernel boot banner is omitted and CRLF is normalized to LF.
+
+===== serial transcript =====
+
+pagh:rv64>
+pagh:rv64> run /mnt/cat /mnt/hello.txt
+hello from pagh-rust 0.6.0
+second line
+run: /mnt/cat exited with code 0
+pagh:rv64> run /mnt/condvar
+condvar: phase 1: all 4 waiters blocked and released the mutex
+condvar: phase 1: notify_all woke every waiter
+condvar: phase 1: scoped join returned each thread's value
+condvar: phase 2: 3 waiters ready
+condvar: phase 2: notify_one woke exactly 1 of 3
+condvar: phase 2: notify_all woke the remaining waiters
+condvar: wait_timeout returned timed_out after 50ms
+condvar: wait_timeout respected the ~50 ms deadline
+condvar: wait_timeout returned the guard re-locked
+condvar: thread::scope let 4 threads borrow &mut stack slots
+CONDVAR PASS
+run: /mnt/condvar exited with code 0
+pagh:rv64> run /mnt/sync_primitives
+sync_primitives: channel capacity 2 (default would be 32)
+sync_primitives: mpsc: 12 values passed through 2 slots (send blocked)
+sync_primitives: mpsc: recv after the last sender -> RecvError
+sync_primitives: mpsc: try_recv on an empty live channel -> Empty
+sync_primitives: mpsc: try_send on a full channel -> Full (value returned)
+sync_primitives: mpsc: try_send after the receiver dropped -> Disconnected
+sync_primitives: mpsc: recv_timeout with no sender -> Disconnected
+sync_primitives: barrier: 8 arrivals, 2 leader(s) over 2 generation(s)
+sync_primitives: barrier: every party released, exactly one leader per generation
+sync_primitives: barrier parties = 4
+sync_primitives: once: closure ran 1 time(s) for 4 threads
+sync_primitives: once: exactly one run, all 4 callers saw is_completed()
+SYNC_PRIMITIVES PASS
+run: /mnt/sync_primitives exited with code 0
+pagh:rv64> run /mnt/udp_echo 10.0.2.2 47986 45680
+udp_echo: bind 0.0.0.0:45680
+udp_echo: local_addr 0.0.0.0:45680
+udp_echo: set_nonblocking(true); recv_from -> WouldBlock (queue empty)
+udp_echo: set_nonblocking(false) restored the blocking mode
+udp_echo: datagram 1: sent 16 bytes to 10.0.2.2:47986, waiting for the echo
+udp_echo: datagram 1: recv 16 bytes from 10.0.2.2:47986
+udp_echo: datagram 1: verified (16 bytes round-tripped)
+udp_echo: datagram 2: sent 300 bytes to 10.0.2.2:47986, waiting for the echo
+udp_echo: datagram 2: recv 300 bytes from 10.0.2.2:47986
+udp_echo: datagram 2: verified (300 bytes round-tripped)
+udp_echo: oversized send (1024 + 1 bytes) rejected: Unknown error (outside the pagh ABI)
+udp_echo: SocketAddr parse/display round-trip ok
+UDP_ECHO PASS
+run: /mnt/udp_echo exited with code 0
+pagh:rv64> run /mnt/io_traits net 10.0.2.2 34139
+io_traits: File Write/Read/Seek/BufRead ok (/mnt/io_traits.txt)
+io_traits: TcpStream Write/BufRead/Read ok (10.0.2.2:34139)
+IO_TRAITS PASS
+run: /mnt/io_traits exited with code 0
+pagh:rv64> run /mnt/tcp_server 45679 2
+tcp_server: bind 0.0.0.0:45679 backlog 4
+tcp_server: local_addr 0.0.0.0:45679
+tcp_server: listening
+tcp_server: accept_nonblocking -> WouldBlock (nothing queued yet)
+tcp_server: accept 1 from 10.0.2.2:47132
+tcp_server: connection 1: peer_addr 10.0.2.2:47132
+tcp_server: connection 1: recv 224 bytes
+tcp_server: connection 1: echo 224 bytes
+tcp_server: connection 1: peer closed (EOF)
+tcp_server: accept 2 from 10.0.2.2:47134
+tcp_server: connection 2: peer_addr 10.0.2.2:47134
+tcp_server: connection 2: recv 400 bytes
+tcp_server: connection 2: echo 400 bytes
+tcp_server: connection 2: peer closed (EOF)
+tcp_server: ephemeral bind: local_addr -> TcpListener::local_addr: binds port 0 and the ABI has no getsockname
+tcp_server: SocketAddr parse/display round-trip ok
+TCP_SERVER PASS (2 connection(s) echoed)
+run: /mnt/tcp_server exited with code 0
+pagh:rv64> halt
+halt: powering off

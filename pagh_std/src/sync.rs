@@ -1,14 +1,18 @@
 //! A single-threaded `LazyLock`, plus the `core::cell` types under std names,
-//! and the kernel-0.13+ futex-backed synchronisation primitives.
+//! the kernel-0.13+ futex-backed synchronisation primitives, and a bounded
+//! [`mpsc`] channel.
 //!
 //! [`LazyLock`] itself lives in the crate-internal `lazy` module so the host
 //! checker can include that file without `libpagh`; it is re-exported here. The [`Mutex`],
-//! [`RwLock`] and [`Condvar`] below are process-private, non-poisoning and not
-//! reentrant, matching the C library's pthread primitives.
+//! [`RwLock`], [`Condvar`], [`Barrier`] and [`Once`] below are process-private,
+//! non-poisoning and not reentrant, matching the C library's pthread
+//! primitives.
 
 pub use core::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 
 pub use crate::lazy::LazyLock;
+
+pub mod mpsc;
 
 // ─── futex-backed synchronization (kernel 0.13+) ────────────────────────────
 //
@@ -397,5 +401,174 @@ impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.state.store(0, Ordering::Release);
         let _ = futex_wake(&self.lock.state, u32::MAX);
+    }
+}
+
+// ─── Barrier ────────────────────────────────────────────────────────────────
+
+/// A rendezvous point for a fixed number of threads.
+///
+/// Every thread calls [`Barrier::wait`]; each call blocks until `n` threads
+/// have arrived, then all of them are released together and the barrier resets
+/// for the next generation. Exactly one thread per generation is the
+/// **leader** (the one whose arrival completed the set) and learns that from
+/// [`BarrierWaitResult::is_leader`].
+///
+/// This is the std shape with one documented deviation: `std` panics on
+/// `Barrier::new(0)` (or on a later `wait`), while this implementation has no
+/// panic path for it — a zero-party barrier releases every caller immediately
+/// as the leader.
+///
+/// The wait is a futex-backed [`Condvar`] wait, so a blocked party sleeps; the
+/// barrier is process-private and non-poisoning like the other primitives in
+/// this module.
+pub struct Barrier {
+    state: Mutex<BarrierState>,
+    /// Signalled when a generation completes.
+    released: Condvar,
+    parties: usize,
+}
+
+struct BarrierState {
+    /// Threads that have arrived in the current generation.
+    arrived: usize,
+    /// Generation counter: a waiter blocks while this is unchanged.
+    generation: usize,
+}
+
+impl Barrier {
+    /// Create a barrier for `parties` threads.
+    pub const fn new(parties: usize) -> Barrier {
+        Barrier {
+            state: Mutex::new(BarrierState {
+                arrived: 0,
+                generation: 0,
+            }),
+            released: Condvar::new(),
+            parties,
+        }
+    }
+
+    /// Wait until `parties` threads have called this method.
+    ///
+    /// Returns a result whose [`is_leader`](BarrierWaitResult::is_leader) is
+    /// true for exactly one caller per generation.
+    pub fn wait(&self) -> BarrierWaitResult {
+        let mut state = self.state.lock();
+        if self.parties == 0 {
+            // Documented deviation: no panic, every caller is a leader.
+            return BarrierWaitResult { leader: true };
+        }
+        let generation = state.generation;
+        state.arrived += 1;
+        if state.arrived >= self.parties {
+            state.arrived = 0;
+            state.generation = generation.wrapping_add(1);
+            drop(state);
+            self.released.notify_all();
+            return BarrierWaitResult { leader: true };
+        }
+        while state.generation == generation {
+            state = self.released.wait(state);
+        }
+        drop(state);
+        BarrierWaitResult { leader: false }
+    }
+
+    /// The number of parties this barrier waits for.
+    pub const fn parties(&self) -> usize {
+        self.parties
+    }
+}
+
+/// The result of [`Barrier::wait`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BarrierWaitResult {
+    leader: bool,
+}
+
+impl BarrierWaitResult {
+    /// True for the single thread that completed the generation.
+    pub const fn is_leader(&self) -> bool {
+        self.leader
+    }
+}
+
+// ─── Once ───────────────────────────────────────────────────────────────────
+
+/// A one-shot initialisation primitive: [`Once::call_once`] runs its closure
+/// exactly once for the whole process, however many threads call it.
+///
+/// The implementation is a three-state machine (incomplete / running /
+/// complete) over a [`Mutex`] and a [`Condvar`]: the first caller runs the
+/// closure with the lock released while the others block; when the closure
+/// returns, every waiter is released and later callers return immediately.
+///
+/// # Contract
+///
+/// * The closure runs at most once, and no caller returns before it has
+///   completed (successful completion is not optional: `panic = "abort"` on
+///   this target, so a panicking closure kills the process rather than leaving
+///   the state poisoned).
+/// * **Reentrancy deadlocks**: calling `call_once` on the same `Once` from
+///   inside its own closure blocks forever, exactly like
+///   `std::sync::Once`. The state has no reentrant owner.
+/// * No poisoning: a `Once` that was completed stays completed, and there is
+///   no error return to inspect.
+pub struct Once {
+    state: Mutex<OnceState>,
+    done: Condvar,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnceState {
+    Incomplete,
+    Running,
+    Complete,
+}
+
+impl Once {
+    /// Create an uninitialised `Once`.
+    pub const fn new() -> Once {
+        Once {
+            state: Mutex::new(OnceState::Incomplete),
+            done: Condvar::new(),
+        }
+    }
+
+    /// Run `f` once, blocking other callers until it finishes.
+    pub fn call_once<F: FnOnce()>(&self, f: F) {
+        let mut state = self.state.lock();
+        match *state {
+            OnceState::Complete => return,
+            OnceState::Running => {
+                // Another thread is inside the closure: wait for it to finish
+                // and then report the completed state.
+                while *state == OnceState::Running {
+                    state = self.done.wait(state);
+                }
+                return;
+            }
+            OnceState::Incomplete => *state = OnceState::Running,
+        }
+        // Release the lock while the closure runs, so the other callers can
+        // observe `Running` and block instead of waiting on the mutex.
+        drop(state);
+
+        f();
+
+        *self.state.lock() = OnceState::Complete;
+        self.done.notify_all();
+    }
+
+    /// True once [`Once::call_once`] has completed its closure.
+    pub fn is_completed(&self) -> bool {
+        *self.state.lock() == OnceState::Complete
+    }
+}
+
+impl Default for Once {
+    fn default() -> Once {
+        Once::new()
     }
 }

@@ -17,22 +17,29 @@ What *is* fully real is **Rust the language** plus the `alloc` crate:
 - `format!`, `println!`, `write!` and the rest of `core::fmt`;
 - a 1 MiB bump heap over `brk`, with `Vec`/`String` growth and OOM handling;
 - this crate's std-shaped layer over files, directories, arguments, paths,
-  buffered I/O, time, process exit, native/scoped threads, synchronisation,
-  signals and a connected TCP client.
+  buffered I/O, time, process exit, native/scoped threads, synchronisation
+  (mutexes, rwlocks, condition variables, channels, barriers, `Once`), signals,
+  and the ABI's IPv4 sockets: a TCP client, a TCP listener and UDP datagrams.
 
 `pagh_std` does **not** claim to be `std`, does not provide dynamic linking or
 `OsStr`, and returns a typed `io::ErrorKind::Unsupported` for operations the
 ABI cannot express. Those are listed under
 [Limitations vs std](#limitations-vs-std).
 
-**Live evidence:** [`docs/live-sdk-0.5.0.txt`](docs/live-sdk-0.5.0.txt) is the
-QEMU serial transcript for this release: `CONDVAR PASS` (4 waiters released by
-`notify_all`, an exact `notify_one`, a 50 ms `wait_timeout`, and `thread::scope`
-with borrowed `&mut` stack slots) and `IO_TRAITS PASS` (`File` through
-`Read`/`Write`/`Seek`/`BufRead`, plus `TcpStream` through `Write`/`BufRead`/`Read`
-against a host server over QEMU user networking). The earlier
-[`docs/live-rust-sdk.txt`](docs/live-rust-sdk.txt) remains the 62/62 transcript
-for the 0.4.0 surface (kernel 0.11.0).
+**Live evidence:** [`docs/live-sdk-0.6.0.txt`](docs/live-sdk-0.6.0.txt) is the
+QEMU serial transcript for this release — one boot that runs the whole 0.6.0
+matrix, **47/47 checks passed** against `pagh-riscv 0.19.0` / QEMU 10.2.2:
+`SYNC_PRIMITIVES PASS` (a bounded channel with three producers blocking on two
+slots, `try_send`/`try_recv`/`recv_timeout`/disconnect, a 4-party barrier over
+two generations, and a 4-thread `Once` race), `UDP_ECHO PASS` (two datagrams
+round-tripped through a host echo server, the `WouldBlock` single-poll shape,
+and the kernel's 1024-byte ceiling), `TCP_SERVER PASS` (bind, the
+`accept_nonblocking` → `WouldBlock` probe, two `accept`s with `peer_addr`, and
+224 + 400 bytes echoed back to a host `--hostfwd` client), plus the `cat`,
+`condvar` and `TcpStream` (`io_traits net`) regressions. The earlier
+[`docs/live-sdk-0.5.0.txt`](docs/live-sdk-0.5.0.txt) (condvar/io-traits) and
+[`docs/live-rust-sdk.txt`](docs/live-rust-sdk.txt) (62/62, the 0.4.0 surface,
+kernel 0.11.0) remain the transcripts for those releases.
 
 ## Repository layout
 
@@ -48,24 +55,30 @@ pagh_std/src/
   fs.rs                    File/OpenOptions/ReadDir/Metadata + fs operations
   env.rs                   args/vars/PWD tracking/temp_dir
   path.rs                  UTF-8 Path/PathBuf/Components + lexical normalize
-  time.rs                  Duration, Instant, SystemTime, sleep
+  time.rs                  Duration, Instant, SystemTime, sleep/sleep_until
   process.rs               exit/abort/fork/execve/wait/Command
   collections/             alloc containers + HashMap/HashSet BTree shims
   hash.rs                  core::hash re-exports + deterministic hasher
   lazy.rs                  single-threaded LazyLock (pure core; host-tested)
-  sync.rs                  Cell/RefCell/OnceCell + futex Mutex/RwLock/Condvar
+  sync.rs                  Cell/RefCell/OnceCell + futex Mutex/RwLock/Condvar,
+                           Barrier, Once
+  sync/mpsc.rs             bounded Sender/Receiver channel over Mutex+Condvar
   thread.rs                Builder/JoinHandle/futex + thread::scope
-  net.rs                   Ipv4 + blocking Read/Write/BufRead TcpStream
+  net.rs                   Ipv4/SocketAddr, TcpStream, TcpListener, UdpSocket
   fmt.rs                   core::fmt re-exports
   panic.rs                 PanicInfo/abort + the runtime contract
   ffi.rs                   c_* types, CStr/CString
-examples/                  cat, wc, find, threads_mutex, spawn, condvar, io_traits
+examples/                  cat, wc, find, threads_mutex, spawn, condvar, io_traits,
+                           tcp_server, udp_echo, sync_primitives
 hostcheck/                 host cargo test for path/hash/LazyLock logic
 tools/probes/              panic/oom/chdir/fsops/clock diagnostic programs
-tools/live_check.py        builds, boots QEMU, runs everything, saves transcript
+tools/live_check.py        builds, boots QEMU, runs the 0.4.0 filesystem matrix
+tools/live_net.py          the 0.6.0 network/sync live matrix (one boot, one
+                           command at a time, host peers, docs/ transcript)
 .github/workflows/ci.yml   fmt + RISC-V build + host tests
 docs/live-rust-sdk.txt     the 0.4.0 captured live run
 docs/live-sdk-0.5.0.txt    the 0.5.0 condvar/io-traits captured runs
+docs/live-sdk-0.6.0.txt    the 0.6.0 network/sync captured run (47/47)
 ```
 
 ## A program
@@ -135,6 +148,9 @@ target/riscv64gc-unknown-none-elf/debug/examples/threads_mutex
 target/riscv64gc-unknown-none-elf/debug/examples/spawn
 target/riscv64gc-unknown-none-elf/debug/examples/condvar
 target/riscv64gc-unknown-none-elf/debug/examples/io_traits
+target/riscv64gc-unknown-none-elf/debug/examples/tcp_server
+target/riscv64gc-unknown-none-elf/debug/examples/udp_echo
+target/riscv64gc-unknown-none-elf/debug/examples/sync_primitives
 ```
 
 Equivalent Cargo invocation:
@@ -171,6 +187,7 @@ Use the kernel from `pagh-riscv` and a host-built ext2 image:
 ```sh
 mkdir -p rootfs/demo/sub
 cp target/riscv64gc-unknown-none-elf/debug/examples/{cat,wc,find,condvar,io_traits} rootfs/
+cp target/riscv64gc-unknown-none-elf/debug/examples/{tcp_server,udp_echo,sync_primitives} rootfs/
 printf 'hello from pagh-rust\nsecond line\n' > rootfs/hello.txt
 printf 'alpha\n' > rootfs/demo/alpha.txt
 printf 'beta\n'  > rootfs/demo/sub/beta.txt
@@ -195,6 +212,9 @@ run /mnt/find /mnt/demo -type f -ls
 run /mnt/condvar
 run /mnt/io_traits
 run /mnt/io_traits net 10.0.2.2 18080   # with --net and a host server
+run /mnt/sync_primitives
+run /mnt/udp_echo 10.0.2.2 18081 45680  # with --net and a host UDP echo server
+run /mnt/tcp_server 45679 2             # with --net --hostfwd 45679:45679
 ```
 
 The shell has no quoting or redirection, so an argument cannot contain a
@@ -237,6 +257,22 @@ python3 tools/run.py --disk /tmp/pagh-rust.img \
 On the default debug kernel both programs print `PASS` and exit 0; the exact
 serial text is in `docs/live-sdk-0.5.0.txt`. A second run with `--net` and a
 host echo server proves the `TcpStream` trait path.
+
+For 0.6.0 the live check is one boot driven by `tools/live_net.py`:
+
+```sh
+python3 tools/live_net.py            # builds, boots, drives, writes docs/
+python3 tools/live_net.py --skip-build --keep-work
+```
+
+It stages the release ELFs in a 64 MiB ext2 image (`mke2fs -d`, no root),
+boots QEMU through `pagh-riscv/tools/run.py --net --hostfwd … --keep`, then
+reconnects to the serial socket and types one command at a time — necessary
+because the shell's UART ring is 16 bytes deep and the `tcp_server` host client
+must not connect before the guest is listening. Host peers: a UDP echo server
+(guest reaches it as `10.0.2.2:<port>`), a TCP server for `io_traits net`, and
+a two-connection TCP client for `tcp_server`. The transcript is
+`docs/live-sdk-0.6.0.txt`; exit status is 0 only when all 47 checks pass.
 
 ## API surface
 
@@ -323,6 +359,12 @@ Arithmetic saturates rather than panicking; `checked_*` methods are available.
 `Instant::now()`/`SystemTime::now()` fall back to zero if the syscall fails;
 `try_now()` surfaces the error.
 
+`time::sleep_until(deadline)` (and the `Instant::sleep_until` method) sleeps
+for the remaining time and returns immediately when the deadline has passed —
+the shape a bounded wait loop needs. `Instant::elapsed_millis` is the same
+elapsed time as a `u64` for log lines. Both inherit the kernel's 10 ms tick:
+`sleep_until` is a deadline with tick granularity, not a real-time guarantee.
+
 ### `pagh_std::path`
 
 UTF-8 `Path` (unsized, `#[repr(transparent)]` over `str`) and `PathBuf`
@@ -369,6 +411,29 @@ The timed wait builds its own `Timespec` on the call frame. This is deliberate:
 already dead by syscall time, so a timed wait reads an arbitrary stack value;
 the SDK-side workaround is covered by the live `wait_timeout` check.
 
+`Barrier::new(parties)` + `wait() -> BarrierWaitResult` is the std rendezvous:
+every party blocks until `parties` have arrived, exactly one caller per
+generation is the leader, and the generation resets. Deviation: `Barrier` never
+panics — a zero-party barrier releases every caller immediately as the leader
+(std panics on `new(0)`).
+
+`Once::new()` + `call_once(f)` + `is_completed()` runs `f` exactly once for the
+process: the first caller runs it with the lock released while the others
+block; when it returns, every waiter is released and later callers return
+immediately. Reentrancy deadlocks, exactly like `std::sync::Once` (the state has
+no reentrant owner); `panic = "abort"` means a panicking closure kills the
+process rather than poisoning the `Once`.
+
+`sync::mpsc` is a **bounded** channel (`std::sync::mpsc` is unbounded): the
+`VecDeque` behind it allocates from a 1 MiB bump heap that never returns
+memory, so `channel()` uses `DEFAULT_CAPACITY` (32) and `sync_channel(n)`
+chooses the depth (0 is clamped to 1 — no zero-capacity rendezvous). The types
+are std-shaped: `Sender`/`SyncSender` (the same type, `Clone` + `Send`),
+`Receiver`, `send` (blocks while full), `try_send`, `recv`, `try_recv`,
+`recv_timeout`, `iter`, and the `SendError`/`RecvError`/`TrySendError`/
+`TryRecvError`/`RecvTimeoutError` types. Dropping every sender disconnects a
+blocked `recv`; dropping the receiver makes `send` return the value.
+
 ### `pagh_std::thread`
 
 `Builder`, `JoinHandle`, `DEFAULT_STACK_SIZE`, `current_id`, `yield_now`,
@@ -386,10 +451,40 @@ can end; the `SAFETY` comments in `thread.rs` state that invariant.
 
 ### `pagh_std::net`
 
-`Ipv4` (literal parse/format) and `TcpStream`: `connect`, `fd`, `shutdown`,
-`read_to_end`, plus `Read`/`Write`/`BufRead` with blocking retry semantics.
-`TcpStream` is a thin pagh_std wrapper over `libpagh::net::TcpStream`; the ABI
-still has one connected client, no listener/accept, UDP, IPv6, DNS or TLS.
+`Ipv4` (literal parse/format) and `SocketAddr` (`Ipv4` + port, `parse`,
+`Display`, `FromStr`) for the ABI's IPv4-only world, plus three socket types.
+All three own their descriptor and are built on `libpagh::sys`'s socket
+syscalls, so the SDK can remember what the ABI cannot report (there is no
+`getsockname`) and can present one blocking shape over non-blocking syscalls.
+
+| Item | Notes |
+|---|---|
+| `TcpStream` | `connect`, `fd`, `peer_addr` (remembered from `connect`/`accept`), `shutdown`, `read_to_end`, `buffered`; `Read`/`Write`/`BufRead` with blocking retry semantics |
+| `TcpListener` | `bind(port)`, `bind_to(address, port)`, `bind_with_backlog`, `fd`, `local_addr`, `accept`, `accept_nonblocking`, `incoming` |
+| `UdpSocket` | `bind(port)`, `bind_to(address, port)`, `fd`, `local_addr`, `set_nonblocking`/`is_nonblocking` (SDK state, `&self`), `send_to`, `recv_from`, `try_recv_from` |
+
+`TcpListener` is created `SOCK_NONBLOCK` at the ABI level: `accept()` retries
+the non-blocking accept and yields the CPU between attempts (the std blocking
+contract — every retry polls the kernel's NIC), while `accept_nonblocking()`
+is a single poll that answers `WouldBlock`. `local_addr` reports the address the
+caller passed to `bind`/`bind_to`; an ephemeral bind (`port == 0`) returns a
+typed `Unsupported` error, because no syscall can report the chosen port.
+`accept` returns the peer address from the accept call itself.
+
+`UdpSocket::recv_from` blocks (retrying the ABI's bounded ≈10 s receive);
+`set_nonblocking(true)` switches it to a single `MSG_DONTWAIT` poll, and
+`try_recv_from` is that poll regardless of the mode. `set_nonblocking` does not
+change `send_to`: the ABI has no non-blocking send shape, and a UDP send can
+block only while ARP resolves the next hop. A datagram larger than the caller's
+buffer is truncated by the kernel; more than 1024 payload bytes is rejected
+before anything is sent.
+
+The kernel's limits apply: one active-open TCP client at a time (accepted
+server connections and the listener have their own descriptors), one listener
+with a four-entry accept queue (backlog clamped to `1..=4`), eight TCP
+connections, eight bound UDP ports, and sixteen file descriptors per process.
+There is no DNS, IPv6, TLS, `getpeername`, `getsockname`, `fcntl`, socket
+option or half-close in this layer.
 
 ### `pagh_std::fmt`, `panic`, `ffi`
 
@@ -444,18 +539,33 @@ Impossible without new kernel syscalls (shown with the SDK's typed
   socket fd is `ENOTSUP` (one TCP connection), and there is no `SIGCHLD`;
   `Command::current_dir` is not applied (no `chdir` syscall); signals are in
   `pagh_std::signal`;
-- **networking without a listener**: `pagh_std::net::TcpStream` can connect to an
-  IPv4 literal and read/write (blocking through the SDK traits); there is no
-  `UdpSocket`, `TcpListener`, DNS or TLS in the ABI;
+- **networking limits**: IPv4 literals only (no DNS), one active-open TCP
+  client at a time, one listener with a four-entry accept queue, eight TCP
+  connections and eight bound UDP ports; no `getsockname`/`getpeername`
+  (`local_addr`/`peer_addr` are the SDK's record of the call), no `fcntl`, so a
+  `TcpStream` cannot be switched to non-blocking and has no `try_clone`, no
+  socket options/`SO_REUSEADDR`, no half-close, and no way to learn an
+  ephemeral port. `libpagh`'s frozen errno table has no `EADDRINUSE`,
+  `EADDRNOTAVAIL` or `EMSGSIZE`, so a bind conflict, a non-local bind address
+  and an oversized datagram arrive as `ErrorKind::Uncategorized` with the
+  message `Unknown error (outside the pagh ABI)` — the kernel did report the
+  specific errno, and the SDK cannot see it. TLS exists in the kernel's own
+  stack (and in `apt`), not in this SDK;
+- **`mpsc` is bounded**: `channel()` holds 32 values and `sync_channel(0)` is
+  clamped to 1; there is no unbounded channel and no zero-capacity rendezvous;
+- **`Barrier`/`Once` deviations**: `Barrier::new(0)` waits for nobody and
+  returns every caller as the leader instead of panicking, and calling
+  `Once::call_once` from inside its own closure deadlocks (as in std);
 - **dynamic linking**, `dlopen`, shared libraries: one static ELF, no loader;
 - **`OsStr`/`OsString` and non-UTF-8 paths**: the SDK stores UTF-8; directory
   names are decoded lossily (U+FFFD), so a non-UTF-8 filename cannot be opened
   by its exact bytes;
 - **`mmap`** is available in the raw `libpagh` ABI (anonymous private pages);
   `pagh_std` still exposes only the `brk` heap;
-- **`poll`/`select`/epoll**, `stdin` EOF: `read(0)` is non-blocking and never
-  reports EOF; `io::Stdin` blocks by yielding, but `cat` with no file waits
-  forever;
+- **`select`/epoll**, `stdin` EOF: `io::poll(&mut [PollFd], timeout)` exists
+  (the ABI's `poll`), but there is no `select`/`epoll`; `read(0)` is
+  non-blocking and never reports EOF, so `io::Stdin` blocks by yielding and
+  `cat` with no file waits forever;
 - **real wall-clock time**, `SystemTime::now` as Unix time, time zones, RTC:
   clock 0 is uptime at 10 ms resolution;
 - **`fsync`/`fdatasync`**, `dup`/`fcntl`, `statfs`, `utimes`, `chown`,
@@ -521,11 +631,18 @@ The transcript covers:
 | Condvar | 0.5.0 transcript: 4 waiters + `notify_all`, exact `notify_one`, 50 ms `wait_timeout`, guard re-locked |
 | scoped threads | 0.5.0 transcript: `thread::scope` joins explicit and dropped handles, returns values, borrows `&mut` slots |
 | File traits | 0.5.0 transcript: `write_all`/`flush`/`seek`, `read_exact`/`read_to_end`, direct `BufRead` and read-ahead/write rewind |
-| TCP traits | 0.5.0 network run: `TcpStream` `write_all`, `read_line`, `Read::read_to_end` against a host server |
+| TCP traits | 0.5.0 network run: `TcpStream` `write_all`, `read_line`, `Read::read_to_end` against a host server; re-run in the 0.6.0 transcript after the stream wrapper was rewritten |
+| TCP listener | 0.6.0 transcript: `bind`/`local_addr`, `accept_nonblocking` → `WouldBlock`, two blocking `accept`s with `peer_addr`, 224 + 400 bytes echoed to a host `--hostfwd` client, ephemeral `local_addr` → `Unsupported` |
+| UDP sockets | 0.6.0 transcript: `bind`/`local_addr`, `set_nonblocking` → `WouldBlock`, 16- and 300-byte datagrams round-tripped through a host echo server, 1025-byte send rejected |
+| mpsc | 0.6.0 transcript: 12 values through a 2-slot channel with blocking `send`, `try_send` Full/Disconnected, `try_recv` Empty, `recv` after disconnect, `recv_timeout` Disconnected |
+| Barrier / Once | 0.6.0 transcript: 4 parties × 2 generations with exactly one leader each, and 4 threads racing one `Once` (one run, all saw `is_completed`) |
 
 `python3 tools/live_check.py` reproduces the 0.4.0 matrix;
 `docs/live-rust-sdk.txt` is that captured run. `docs/live-sdk-0.5.0.txt` is the
-focused 0.5.0 run with its kernel/QEMU/toolchain header.
+focused 0.5.0 run with its kernel/QEMU/toolchain header. `python3
+tools/live_net.py` reproduces the 0.6.0 network/sync matrix in one boot and
+rewrites `docs/live-sdk-0.6.0.txt` (47/47 checks, kernel hash and ELF hashes
+included).
 
 ## CI
 
@@ -536,7 +653,8 @@ focused 0.5.0 run with its kernel/QEMU/toolchain header.
 3. runs `cargo fmt -p pagh_std -p pagh_hostcheck -p pagh_probes -- --check`
    (package-scoped because `--all` would reformat the sibling `pagh-api`);
 4. runs `./build.sh --fixtures` (all examples and probes);
-5. asserts every example is ≤ 1 MiB;
+5. asserts every example — including `tcp_server`, `udp_echo` and
+   `sync_primitives` — is ≤ 1 MiB;
 6. runs `cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu --locked`;
 7. uploads the example ELFs.
 

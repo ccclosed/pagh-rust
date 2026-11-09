@@ -1,6 +1,6 @@
 [package]
 name = "pagh_std"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 publish = false
 description = "A std-like Rust layer over the pagh-riscv native ABI (libpagh)"
@@ -43,3 +43,15 @@ path = "../examples/condvar.rs"
 [[example]]
 name = "io_traits"
 path = "../examples/io_traits.rs"
+
+[[example]]
+name = "tcp_server"
+path = "../examples/tcp_server.rs"
+
+[[example]]
+name = "udp_echo"
+path = "../examples/udp_echo.rs"
+
+[[example]]
+name = "sync_primitives"
+path = "../examples/sync_primitives.rs"

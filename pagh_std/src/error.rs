@@ -15,10 +15,19 @@ use libpagh::errno::Errno;
 
 /// The error class, modeled on `std::io::ErrorKind`.
 ///
-/// The variants are a practical subset of std's: the ABI has no networking,
-/// signals or process-spawning errors, so there is no `ConnectionRefused`,
-/// `Interrupted`, `BrokenPipe` and so on. `BadFileDescriptor` is pagh-specific
-/// in name; std folds the same condition into `Uncategorized` today.
+/// The variants are a practical subset of std's: the ABI's networking is IPv4
+/// TCP/UDP only, and a wait is not interruptible by a signal in this SDK, so
+/// there is no `Interrupted`, `Deadlock` or `CrossesDevices`.
+/// `BadFileDescriptor` is pagh-specific in name; std folds the same condition
+/// into `Uncategorized` today.
+///
+/// `libpagh`'s frozen errno table has no `EADDRINUSE`, `EADDRNOTAVAIL` or
+/// `EMSGSIZE` entry, and it does not carry an unmapped number through (such a
+/// result becomes [`Errno::Unknown`], whose raw value is 0 and whose message is
+/// `Unknown error (outside the pagh ABI)`). A bind conflict, a non-local bind
+/// address or a datagram above the kernel's 1024-byte ceiling therefore arrives
+/// as [`ErrorKind::Uncategorized`]; the kernel did report the specific errno,
+/// and the SDK cannot see it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(missing_docs)]
 pub enum ErrorKind {
@@ -62,6 +71,18 @@ pub enum ErrorKind {
     FileTooLarge,
     /// The descriptor does not refer to an open file (`EBADF`).
     BadFileDescriptor,
+    /// The peer refused the connection (`ECONNREFUSED`).
+    ConnectionRefused,
+    /// The peer reset the connection (`ECONNRESET`).
+    ConnectionReset,
+    /// The descriptor is a socket, but not a connected one (`ENOTCONN`).
+    NotConnected,
+    /// The kernel's own deadline expired (`ETIMEDOUT`).
+    TimedOut,
+    /// There is no DHCP lease or no route to the network (`ENETUNREACH`).
+    NetworkUnreachable,
+    /// ARP could not resolve the next hop (`EHOSTUNREACH`).
+    HostUnreachable,
     /// The ABI has no syscall for this operation (`ENOSYS`, `ENOTSUP`), or the
     /// SDK chose not to emulate it because doing so would be unsound or
     /// misleading.
@@ -97,17 +118,16 @@ impl ErrorKind {
             Errno::EOVERFLOW => ErrorKind::FileTooLarge,
             Errno::ENOTSUP => ErrorKind::Unsupported,
             Errno::EPIPE => ErrorKind::BrokenPipe,
-            Errno::ENOTSOCK
-            | Errno::EAFNOSUPPORT
-            | Errno::ENETUNREACH
-            | Errno::EHOSTUNREACH
-            | Errno::ECONNREFUSED
-            | Errno::ECONNRESET
-            | Errno::EISCONN
-            | Errno::ENOTCONN
-            | Errno::ETIMEDOUT => ErrorKind::Uncategorized,
+            Errno::ECONNREFUSED => ErrorKind::ConnectionRefused,
+            Errno::ECONNRESET => ErrorKind::ConnectionReset,
+            Errno::ENOTCONN => ErrorKind::NotConnected,
+            Errno::ETIMEDOUT => ErrorKind::TimedOut,
+            Errno::ENETUNREACH => ErrorKind::NetworkUnreachable,
+            Errno::EHOSTUNREACH => ErrorKind::HostUnreachable,
+            Errno::ENOTSOCK | Errno::EAFNOSUPPORT | Errno::EISCONN | Errno::Unknown => {
+                ErrorKind::Uncategorized
+            }
             Errno::ENOPROTOOPT => ErrorKind::Unsupported,
-            Errno::Unknown => ErrorKind::Uncategorized,
         }
     }
 }

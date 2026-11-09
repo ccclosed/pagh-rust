@@ -67,7 +67,7 @@ jobs:
         working-directory: pagh-rust
         run: |
           set -euo pipefail
-          for elf in cat wc find threads_mutex spawn condvar io_traits; do
+          for elf in cat wc find threads_mutex spawn condvar io_traits tcp_server udp_echo sync_primitives; do
             path="target/riscv64gc-unknown-none-elf/debug/examples/$elf"
             size=$(wc -c <"$path")
             echo "$path: $size bytes"
@@ -90,5 +90,8 @@ jobs:
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/spawn
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/condvar
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/io_traits
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/tcp_server
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/udp_echo
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/sync_primitives
           if-no-files-found: error
           retention-days: 14
