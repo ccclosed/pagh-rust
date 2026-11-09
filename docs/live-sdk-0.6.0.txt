@@ -1,8 +1,8 @@
 pagh-rust — live SDK verification for 0.6.0
 ===========================================
-date (UTC):         2026-11-09T13:15:40Z
+date (UTC):         2026-11-09T13:17:54Z
 crate:              pagh_std 0.6.0
-source state:       git 7f019f729de39cc9af055e9a8fec2536d7eeee16 (working tree dirty)
+source state:       git 4aa66becb446fc343157316fab8f5c510c1c3432 (clean)
 toolchain:          rustc 1.99.0-nightly (be8e82435 2026-07-11)
 target:             riscv64gc-unknown-none-elf
 kernel package:     pagh-riscv 0.19.0 (the kernel tree was not modified)
@@ -18,13 +18,13 @@ release ELF:        io_traits sha256 d9d38dfa10866365df523698171e830d0ea3d8c7ddd
 release ELF:        sync_primitives sha256 a5c2ab727c4495a5838c87de481b5daf0401b40c989e81d9033645f1add3d711
 release ELF:        tcp_server sha256 7292244298718eb55855d0cc0f21788d6e9fba2d0cc7103c279cf2f966877cd5
 release ELF:        udp_echo sha256 f506f3320a27c0d4162b4ac953135389bee2eedd3f65a27aca907471d7cab0f5
-boot:               pagh-riscv/tools/run.py --net --hostfwd 127.0.0.1:37243->guest:45679 --keep
+boot:               pagh-riscv/tools/run.py --net --hostfwd 127.0.0.1:34815->guest:45679 --keep
 guest driver:       tools/live_net.py reconnects to the serial socket and types one
                     command at a time (the shell's UART ring is 16 bytes deep)
 host peers:         UDP echo server on 127.0.0.1:<ephemeral>, which the guest reaches
-                    as 10.0.2.2:47986
-                    io_traits TCP server, which the guest reaches as 10.0.2.2:34139
-                    tcp_server client on 127.0.0.1:37243 (two connections)
+                    as 10.0.2.2:56902
+                    io_traits TCP server, which the guest reaches as 10.0.2.2:38301
+                    tcp_server client on 127.0.0.1:34815 (two connections)
 
 checks:             47 passed, 0 failed
   PASS  cat printed the staged file
@@ -113,24 +113,24 @@ sync_primitives: once: closure ran 1 time(s) for 4 threads
 sync_primitives: once: exactly one run, all 4 callers saw is_completed()
 SYNC_PRIMITIVES PASS
 run: /mnt/sync_primitives exited with code 0
-pagh:rv64> run /mnt/udp_echo 10.0.2.2 47986 45680
+pagh:rv64> run /mnt/udp_echo 10.0.2.2 56902 45680
 udp_echo: bind 0.0.0.0:45680
 udp_echo: local_addr 0.0.0.0:45680
 udp_echo: set_nonblocking(true); recv_from -> WouldBlock (queue empty)
 udp_echo: set_nonblocking(false) restored the blocking mode
-udp_echo: datagram 1: sent 16 bytes to 10.0.2.2:47986, waiting for the echo
-udp_echo: datagram 1: recv 16 bytes from 10.0.2.2:47986
+udp_echo: datagram 1: sent 16 bytes to 10.0.2.2:56902, waiting for the echo
+udp_echo: datagram 1: recv 16 bytes from 10.0.2.2:56902
 udp_echo: datagram 1: verified (16 bytes round-tripped)
-udp_echo: datagram 2: sent 300 bytes to 10.0.2.2:47986, waiting for the echo
-udp_echo: datagram 2: recv 300 bytes from 10.0.2.2:47986
+udp_echo: datagram 2: sent 300 bytes to 10.0.2.2:56902, waiting for the echo
+udp_echo: datagram 2: recv 300 bytes from 10.0.2.2:56902
 udp_echo: datagram 2: verified (300 bytes round-tripped)
 udp_echo: oversized send (1024 + 1 bytes) rejected: Unknown error (outside the pagh ABI)
 udp_echo: SocketAddr parse/display round-trip ok
 UDP_ECHO PASS
 run: /mnt/udp_echo exited with code 0
-pagh:rv64> run /mnt/io_traits net 10.0.2.2 34139
+pagh:rv64> run /mnt/io_traits net 10.0.2.2 38301
 io_traits: File Write/Read/Seek/BufRead ok (/mnt/io_traits.txt)
-io_traits: TcpStream Write/BufRead/Read ok (10.0.2.2:34139)
+io_traits: TcpStream Write/BufRead/Read ok (10.0.2.2:38301)
 IO_TRAITS PASS
 run: /mnt/io_traits exited with code 0
 pagh:rv64> run /mnt/tcp_server 45679 2
@@ -138,13 +138,13 @@ tcp_server: bind 0.0.0.0:45679 backlog 4
 tcp_server: local_addr 0.0.0.0:45679
 tcp_server: listening
 tcp_server: accept_nonblocking -> WouldBlock (nothing queued yet)
-tcp_server: accept 1 from 10.0.2.2:47132
-tcp_server: connection 1: peer_addr 10.0.2.2:47132
+tcp_server: accept 1 from 10.0.2.2:38936
+tcp_server: connection 1: peer_addr 10.0.2.2:38936
 tcp_server: connection 1: recv 224 bytes
 tcp_server: connection 1: echo 224 bytes
 tcp_server: connection 1: peer closed (EOF)
-tcp_server: accept 2 from 10.0.2.2:47134
-tcp_server: connection 2: peer_addr 10.0.2.2:47134
+tcp_server: accept 2 from 10.0.2.2:38946
+tcp_server: connection 2: peer_addr 10.0.2.2:38946
 tcp_server: connection 2: recv 400 bytes
 tcp_server: connection 2: echo 400 bytes
 tcp_server: connection 2: peer closed (EOF)
