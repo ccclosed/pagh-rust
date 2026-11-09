@@ -18,10 +18,11 @@
 //! bounded channel, barriers and `Once`** ([`sync`]), the ABI's IPv4 sockets —
 //! **a TCP client, a TCP listener, UDP datagrams, a DNS stub resolver and
 //! `connect("host:port")`** ([`net`]) — **TLS 1.3 with fail-closed server
-//! authentication** ([`tls`]) and **signals** ([`signal`]). Operations the ABI
-//! cannot express (`fsync`, `O_EXCL`, `dup`, `OsStr`, dynamic linking, a
-//! per-descriptor non-blocking flag) remain typed `Unsupported` errors instead
-//! of silent stubs.
+//! authentication** ([`tls`], the kernel's own client through syscalls
+//! 1100–1103) and **signals** ([`signal`]). Operations the ABI cannot express
+//! (`fsync`, `O_EXCL`, `dup`, `OsStr`, dynamic linking, a per-descriptor
+//! non-blocking flag, a wall-clock read) remain typed `Unsupported` errors
+//! instead of silent stubs.
 //!
 //! # Program shape
 //!
@@ -58,15 +59,20 @@
 //! * console `read(0)` is non-blocking and has no EOF (the `io::Stdin` handle
 //!   hides the non-blocking part by yielding, but EOF never arrives);
 //! * no `statat`, `O_EXCL`, `O_DIRECTORY`, `O_NOFOLLOW`, `fsync`, `dup` on a
-//!   socket, RTC or dynamic linker — and **no entropy source at all**;
+//!   socket or a dynamic linker, and no wall-clock syscall
+//!   (`clock_gettime(CLOCK_REALTIME)` is the uptime counter); entropy comes
+//!   from `getrandom` (278), which the kernel refuses to answer until its pool
+//!   is seeded;
 //! * IPv4 only: one active-open TCP client at a time, one listener with a
 //!   four-entry accept queue, eight TCP connections and eight bound UDP ports,
 //!   and a 1024-byte UDP datagram ceiling;
 //! * DNS is the SDK's own stub resolver ([`net::dns`]), because the ABI has no
 //!   resolver call and cannot report the DHCP lease;
-//! * TLS ([`tls`]) requires a wall clock and 32 bytes of entropy **from the
-//!   caller**: `clock_gettime(CLOCK_REALTIME)` is the uptime counter here and
-//!   there is no `getrandom`.
+//! * TLS ([`tls`]) takes **no** clock and **no** entropy from the caller: the
+//!   handshake, the RTC clock gate and the entropy pool are the kernel's
+//!   (pagh-riscv 0.21.0, `tls_connect` 1100). The 0.7.0 userland implementation
+//!   that had to be handed both stays behind the `vendored-tls` feature; it now
+//!   takes its seed from `getrandom` but still needs the caller's clock.
 //!
 //! # Modules
 //!
@@ -82,7 +88,7 @@
 //! | [`sync`] | `Cell`, `RefCell`, `OnceCell`, `LazyLock`, futex-backed `Mutex`/`RwLock`/`Condvar`/`Barrier`/`Once`, bounded `mpsc` |
 //! | [`thread`] | native `Builder`/`JoinHandle`, futex wait/wake, `thread::scope` with borrowed closures |
 //! | [`net`] | `Ipv4`, `SocketAddr`, `TcpStream` (blocking/`WouldBlock`, timeouts, `try_clone`), `TcpListener`, `UdpSocket`, `dns`, `connect("host:port")` |
-//! | [`tls`] | TLS 1.3 over a `TcpStream`: fail-closed verification, committed CA bundle, `https_get` |
+//! | [`tls`] | TLS 1.3 over a `TcpStream` via the kernel's fail-closed client: `TlsStream` (`connect`, read/write, close), `https_get`, `http`; `vendored` (feature `vendored-tls`) is the 0.7.0 userland stack |
 //! | [`fmt`] | `core::fmt` re-exports; `print!`, `println!`, `eprint!`, `eprintln!`, `dbg!`, `format!`, `vec!`, `write!`, `writeln!` |
 //! | [`panic`] | `PanicInfo`, `abort`; the handler contract and why `libpagh` owns it |
 //! | [`ffi`] | `c_*` types and `CStr`/`CString` for a future C boundary |

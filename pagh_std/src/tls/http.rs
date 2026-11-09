@@ -1,14 +1,12 @@
 //! Pure HTTP/1.1 request building and response-head parsing.
 //!
-//! This task (7.1) implements only the **pure** core of the `Package_Fetcher`
-//! (design component 7): allocation-aware but socket-free logic that builds a
-//! `GET` request and parses an HTTP response head. It is `core` + `alloc` only —
-//! no socket types, no globals, no hardware — so it compiles into both the
-//! kernel (`crate::net::http`) and the `host-tests` crate via `#[path]` include,
-//! letting properties P20/P21 exercise the same source (R11.6).
-//!
-//! The effectful `fetch_deb` shell that pumps a real TCP socket and calls
-//! [`parse_http_head`] lands in task 14.1.
+//! This is the **pure** core of an HTTP fetch: allocation-aware but socket-free
+//! logic that builds a `GET` request and parses an HTTP response head. It is
+//! `core` + `alloc` only — no socket types, no globals, no hardware — so it
+//! compiles into the kernel (`crate::net::http` there), into this SDK's TLS
+//! paths (the kernel-backed [`super::TlsStream::read_http_response`] and the
+//! vendored `https_get`), and into the `host-tests` crate via `#[path]` include,
+//! letting the host properties exercise the same source the programs run.
 //!
 //! All parsing is hardened against adversarial input: every index is bounds
 //! checked, slicing uses half-open ranges derived from found positions, and no

@@ -3,7 +3,7 @@ name = "pagh_hostcheck"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Host-only unit tests for the pure logic inside pagh_std (path, hash, LazyLock)"
+description = "Host-only unit tests for the pure logic inside pagh_std (path, hash, LazyLock, collections, dns_wire, tls url/http/hostname)"
 
 [lib]
 name = "pagh_hostcheck"

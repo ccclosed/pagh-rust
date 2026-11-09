@@ -1,6 +1,6 @@
 [package]
 name = "pagh_std"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 publish = false
 description = "A std-like Rust layer over the pagh-riscv native ABI (libpagh)"
@@ -15,33 +15,64 @@ path = "src/lib.rs"
 # `pagh-api`; see the workspace README for `PAGH_API` and the sibling layout.
 libpagh = { path = "../../pagh-api/libpagh" }
 
-# The real programs live at the repository root (`examples/`) so the SDK and its
-# examples read like one project, not like test fixtures hidden inside the crate.
-# ─── TLS 1.3 (0.7.0) ────────────────────────────────────────────────────────
-# Vendored, byte-pinned crates (see `vendor/` + `.gitattributes`): the same
-# `embedded-tls` 0.19.0 the kernel links, carrying the same deliberate local
+# ─── TLS 1.3 ────────────────────────────────────────────────────────────
+# The default `pagh_std::tls` needs NONE of this: since 0.8.0 the TLS 1.3
+# handshake and its verification live in the kernel (syscalls 1100-1103), so the
+# SDK only wraps `tls_connect`/`tls_read`/`tls_write`/`tls_close`. The crates
+# below are the 0.7.0 userland implementation, kept behind the `vendored-tls`
+# feature (module `pagh_std::tls::vendored`) and built only on request:
+#
+#     ./build.sh --vendored        # or: cargo build --features vendored-tls
+#
+# They are vendored, byte-pinned crates (see `vendor/` + `.gitattributes`): the
+# same `embedded-tls` 0.19.0 the kernel links, carrying the same deliberate local
 # patch (`src/connection.rs` refuses `Finished` unless `Certificate` and
 # `CertificateVerify` preceded it — see the README's TLS section), plus the
 # verify-only crypto backends the ported chain verifier dispatches on.
-# `default-features = false` everywhere: no std, no log, no tokio; `alloc`
-# routes embedded-tls's record buffers through the SDK's heap.
-embedded-tls = { version = "=0.19.0", default-features = false, features = ["alloc"] }
-embedded-io = { version = "=0.7.1", default-features = false }
-embedded-io-async = { version = "=0.7.0", default-features = false }
+# `default-features = false` everywhere and `optional = true` so a default build
+# compiles none of them: no std, no log, no tokio; `alloc` routes embedded-tls's
+# record buffers through the SDK's heap.
+embedded-tls = { version = "=0.19.0", default-features = false, features = ["alloc"], optional = true }
+embedded-io = { version = "=0.7.1", default-features = false, optional = true }
+embedded-io-async = { version = "=0.7.0", default-features = false, optional = true }
 # The handshake RNG trait (`RngCore` + `CryptoRng`).
-rand_chacha = { version = "=0.3.1", default-features = false }
-rand_core = { version = "=0.6.4", default-features = false }
+rand_chacha = { version = "=0.3.1", default-features = false, optional = true }
+rand_core = { version = "=0.6.4", default-features = false, optional = true }
 # Chain/signature verification backends (verify-only, no key generation):
 # RSASSA-PKCS1-v1_5 (rsa), ECDSA P-384 (p384), Ed25519 (ed25519-dalek), the
 # SHA-2 digests the X.509 layer hashes with, ECDSA P-256 and the `Verifier`
 # trait shared by all of them.
-rsa = { version = "=0.9.9", default-features = false, features = ["sha2"] }
-p384 = { version = "=0.13.0", default-features = false, features = ["ecdsa", "sha384"] }
-ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast"] }
-sha2 = { version = "=0.10.9", default-features = false, features = ["oid"] }
-p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa"] }
-signature = { version = "=2.2.0", default-features = false }
-const-oid = { version = "=0.9.6", default-features = false }
+rsa = { version = "=0.9.9", default-features = false, features = ["sha2"], optional = true }
+p384 = { version = "=0.13.0", default-features = false, features = ["ecdsa", "sha384"], optional = true }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast"], optional = true }
+sha2 = { version = "=0.10.9", default-features = false, features = ["oid"], optional = true }
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa"], optional = true }
+signature = { version = "=2.2.0", default-features = false, optional = true }
+const-oid = { version = "=0.9.6", default-features = false, optional = true }
+
+# The real programs live at the repository root (`examples/`) so the SDK and its
+# examples read like one project, not like test fixtures hidden inside the crate;
+# `tls_get_vendored` is the one that needs the `vendored-tls` feature above.
+
+[features]
+# Off by default: the kernel-backed TLS path must not drag a TLS stack, a CA
+# bundle and five crypto backends into every program's image. See
+# `pagh_std/src/tls/vendored/mod.rs` for what the feature buys and costs.
+default = []
+vendored-tls = [
+    "dep:embedded-tls",
+    "dep:embedded-io",
+    "dep:embedded-io-async",
+    "dep:rand_chacha",
+    "dep:rand_core",
+    "dep:rsa",
+    "dep:p384",
+    "dep:ed25519-dalek",
+    "dep:sha2",
+    "dep:p256",
+    "dep:signature",
+    "dep:const-oid",
+]
 
 [[example]]
 name = "cat"
@@ -97,3 +128,10 @@ path = "../examples/socket_opts.rs"
 [[example]]
 name = "tls_get"
 path = "../examples/tls_get.rs"
+
+[[example]]
+name = "tls_get_vendored"
+path = "../examples/tls_get_vendored.rs"
+# The vendored example only exists when its implementation does: without the
+# feature there is no `pagh_std::tls::vendored` to call.
+required-features = ["vendored-tls"]

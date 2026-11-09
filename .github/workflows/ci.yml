@@ -65,25 +65,30 @@ jobs:
 
       - name: Check the kernel 1 MiB image limit
         working-directory: pagh-rust
+        # Every example that a default build produces, including 0.8.0's
+        # kernel-backed `tls_get` (290 KiB debug — it links no TLS stack at all).
         run: |
           set -euo pipefail
-          for elf in cat wc find threads_mutex spawn condvar io_traits tcp_server udp_echo sync_primitives; do
+          for elf in cat wc find threads_mutex spawn condvar io_traits tcp_server udp_echo \
+                     sync_primitives hash_map dns socket_opts tls_get; do
             path="target/riscv64gc-unknown-none-elf/debug/examples/$elf"
             size=$(wc -c <"$path")
             echo "$path: $size bytes"
             test "$size" -le 1048576
           done
 
-      - name: Check the 0.7.0 examples against the 1 MiB limit (release)
+      - name: Build the vendored TLS path and check it against the 1 MiB limit (release)
         working-directory: pagh-rust
-        # `tls_get` is release-only: the debug profile links the crypto
-        # backends unoptimized and the image is 1.19 MiB, over the kernel's
-        # limit. The live matrix (`tools/live_070.py`) runs release for the
-        # same reason, so that is the profile these four are gated in.
+        # The 0.7.0 userland implementation is off by default and stays
+        # release-only: `tls_get_vendored` links the vendored embedded-tls and
+        # crypto backends, and its debug image is 1.19 MiB, over the kernel's
+        # limit. Its live matrix (`tools/live_070.py`) runs release for the same
+        # reason. `tls_get` is in the list too, so the two paths are sized in
+        # one place.
         run: |
           set -euo pipefail
-          ./build.sh --release
-          for elf in hash_map dns socket_opts tls_get; do
+          ./build.sh --release --vendored
+          for elf in tls_get tls_get_vendored hash_map dns socket_opts; do
             path="target/riscv64gc-unknown-none-elf/release/examples/$elf"
             size=$(wc -c <"$path")
             echo "$path: $size bytes"
@@ -109,9 +114,10 @@ jobs:
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/tcp_server
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/udp_echo
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/sync_primitives
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/tls_get
             pagh-rust/target/riscv64gc-unknown-none-elf/release/examples/hash_map
             pagh-rust/target/riscv64gc-unknown-none-elf/release/examples/dns
             pagh-rust/target/riscv64gc-unknown-none-elf/release/examples/socket_opts
-            pagh-rust/target/riscv64gc-unknown-none-elf/release/examples/tls_get
+            pagh-rust/target/riscv64gc-unknown-none-elf/release/examples/tls_get_vendored
           if-no-files-found: error
           retention-days: 14

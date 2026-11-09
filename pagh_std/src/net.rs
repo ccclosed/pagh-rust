@@ -202,9 +202,27 @@ struct StreamHandle {
     fd: i32,
 }
 
+impl StreamHandle {
+    /// Hand the descriptor to a new owner: `fd` becomes [`RELEASED`], so
+    /// `Drop` no longer closes it.
+    ///
+    /// Only sound when this is the last handle — see [`TcpStream::into_fd`].
+    fn release(&mut self) -> i32 {
+        let fd = self.fd;
+        self.fd = RELEASED;
+        fd
+    }
+}
+
+/// The `fd` value of a [`StreamHandle`] whose descriptor now belongs to someone
+/// else. Not a valid descriptor, so `close` can never be called on it.
+const RELEASED: i32 = -1;
+
 impl Drop for StreamHandle {
     fn drop(&mut self) {
-        let _ = sys::close(self.fd);
+        if self.fd != RELEASED {
+            let _ = sys::close(self.fd);
+        }
     }
 }
 
@@ -298,6 +316,44 @@ impl TcpStream {
     /// The underlying socket descriptor.
     pub fn fd(&self) -> i32 {
         self.handle.fd
+    }
+
+    /// Take the descriptor out of this stream, leaving nothing to close.
+    ///
+    /// The TLS session syscalls take ownership of a connected socket's
+    /// descriptor (`tls_connect`, syscall 1100), so handing ours over has to
+    /// disarm this value's `Drop`: a `TcpStream` that both gave its descriptor
+    /// away and closed it later would close the TLS session out from under its
+    /// owner, and the number could have been reused by then.
+    ///
+    /// Refused, with the stream intact, when a [`try_clone`] handle still
+    /// shares the descriptor (`Unsupported`: two owners cannot both hand it
+    /// over) or when the `BufRead` read-ahead holds bytes (`InvalidInput`:
+    /// those bytes are the caller's, and losing them between the TCP
+    /// connection and the TLS handshake would corrupt the stream). Drain or
+    /// drop the stream normally in either case.
+    ///
+    /// [`try_clone`]: TcpStream::try_clone
+    pub fn into_fd(mut self) -> Result<i32> {
+        if Arc::strong_count(&self.handle) != 1 {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "TcpStream::into_fd: a try_clone handle still shares the descriptor",
+            ));
+        }
+        if !self.read_ahead.buffered().is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "TcpStream::into_fd: the BufRead read-ahead holds bytes; drain them first",
+            ));
+        }
+        let handle = Arc::get_mut(&mut self.handle).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unsupported,
+                "TcpStream::into_fd: the descriptor is shared",
+            )
+        })?;
+        Ok(handle.release())
     }
 
     /// The peer's address, as passed to [`TcpStream::connect`] or returned by
@@ -1123,7 +1179,11 @@ pub fn connect(host_port: &str) -> Result<TcpStream> {
 }
 
 /// Split `host:port` into its two halves, rejecting everything malformed.
-fn split_host_port(text: &str) -> Result<(&str, u16)> {
+///
+/// Also the parser behind [`TlsStream::connect`](crate::tls::TlsStream::connect),
+/// which takes the same shape and then hands the TCP stream to the kernel's
+/// TLS session syscall.
+pub(crate) fn split_host_port(text: &str) -> Result<(&str, u16)> {
     let (host, port) = text.rsplit_once(':').ok_or_else(|| {
         Error::new(
             ErrorKind::InvalidInput,

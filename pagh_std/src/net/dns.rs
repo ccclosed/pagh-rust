@@ -32,10 +32,11 @@
 //! * no caching beyond the process's own calls, and no `search`/`ndots`
 //!   processing: a relative name is sent as-is;
 //! * the transaction id comes from a counter seeded with the monotonic clock,
-//!   so it varies between queries but is **not** unpredictable — the ABI has no
-//!   entropy source, and a resolver that claimed spoofing resistance here would
-//!   be lying. The parser's question-echo check is what rejects off-path
-//!   datagrams that guess the id.
+//!   so it varies between queries but is **not** unpredictable: `getrandom`
+//!   exists since pagh-riscv 0.21.0, but this resolver does not call it, and a
+//!   resolver that claimed spoofing resistance here would be lying. The
+//!   parser's question-echo check is what rejects off-path datagrams that guess
+//!   the id.
 
 use alloc::vec::Vec;
 
@@ -390,7 +391,8 @@ fn rcode_error(rcode: u8) -> Error {
 
 /// Transaction ids for the process, seeded from the monotonic clock.
 ///
-/// Documented as *varying*, not unpredictable: the ABI has no entropy source
+/// Documented as *varying*, not unpredictable: this counter does not call
+/// `getrandom` (which the ABI has had since pagh-riscv 0.21.0)
 /// (see the module docs). The question-echo check in the parser is what makes a
 /// guessed id insufficient.
 fn next_transaction_id() -> u16 {

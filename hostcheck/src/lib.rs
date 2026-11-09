@@ -43,12 +43,21 @@ mod lazy;
 // hostname matcher the TLS verifier authorizes with, and the HTTP/1.1 head
 // parser the fetch uses. All three are `core` + `alloc` only, so they are
 // tested here with adversarial input instead of only against a live server.
+// `hostname` belongs to the vendored (feature `vendored-tls`) verifier; it is
+// included unconditionally because it is pure and the gate is cheap.
 #[path = "../../pagh_std/src/net/dns_wire.rs"]
 mod dns_wire;
-#[path = "../../pagh_std/src/tls/hostname.rs"]
+#[path = "../../pagh_std/src/tls/vendored/hostname.rs"]
 mod hostname;
 #[path = "../../pagh_std/src/tls/http.rs"]
 mod http;
+
+// The 0.8.0 pure layer: the `https://host[:port][/path]` parser the
+// kernel-backed `tls::https_get` feeds to `tls_connect`. It decides which name
+// the certificate gets checked against, so it is exactly the kind of code that
+// must be tested against adversarial input rather than only against a live URL.
+#[path = "../../pagh_std/src/tls/url.rs"]
+mod tls_url;
 
 #[cfg(test)]
 mod tests {
@@ -611,5 +620,75 @@ mod set_probe_release {
             set.is_subset(&union),
             set.is_disjoint(&HashSet::new()),
         );
+    }
+}
+
+#[cfg(test)]
+mod pure_080 {
+    use super::tls_url::{Target, UrlError};
+
+    #[test]
+    fn urls_parse_to_host_port_and_path() {
+        let target = Target::parse("https://example.com/").unwrap();
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, 443);
+        assert_eq!(target.path, "/");
+        assert_eq!(target.host_port(), "example.com:443");
+        assert_eq!(
+            target.get_request(),
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+        );
+
+        // No path means the root document, and an explicit port wins over the
+        // default; the query string stays part of the path.
+        let target = Target::parse("https://example.com:8443").unwrap();
+        assert_eq!(target.port, 8443);
+        assert_eq!(target.path, "/");
+        let target = Target::parse("https://example.com/a/b?c=d#e").unwrap();
+        assert_eq!(target.path, "/a/b?c=d#e");
+        assert_eq!(target.host_port(), "example.com:443");
+
+        // A dotted-quad is a host like any other; the SAN check decides later.
+        let target = Target::parse("https://10.0.2.2:4443/x").unwrap();
+        assert_eq!(target.host, "10.0.2.2");
+        assert_eq!(target.port, 4443);
+    }
+
+    #[test]
+    fn malformed_urls_are_refused_not_guessed() {
+        assert_eq!(
+            Target::parse("http://example.com/"),
+            Err(UrlError::NotHttps)
+        );
+        assert_eq!(Target::parse("https:///x"), Err(UrlError::NoHost));
+        assert_eq!(
+            Target::parse("https://example.com:no/"),
+            Err(UrlError::BadPort)
+        );
+        // A port outside u16 is a parse failure, not a wrap.
+        assert_eq!(
+            Target::parse("https://example.com:70000/"),
+            Err(UrlError::BadPort)
+        );
+        assert_eq!(
+            Target::parse("https://user@example.com/"),
+            Err(UrlError::Malformed)
+        );
+        assert_eq!(Target::parse(""), Err(UrlError::NotHttps));
+    }
+
+    #[test]
+    fn every_port_renders_its_exact_digits() {
+        // `host_port` is what `TlsStream::connect` re-parses, so the rendering
+        // has to round-trip for the boundaries and for a value with zeros.
+        for (url, expected) in [
+            ("https://h:1/", "h:1"),
+            ("https://h:80/", "h:80"),
+            ("https://h:1000/", "h:1000"),
+            ("https://h:65535/", "h:65535"),
+            ("https://h:443/", "h:443"),
+        ] {
+            assert_eq!(Target::parse(url).unwrap().host_port(), expected);
+        }
     }
 }

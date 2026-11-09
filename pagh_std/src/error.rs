@@ -124,6 +124,16 @@ impl ErrorKind {
             Errno::ETIMEDOUT => ErrorKind::TimedOut,
             Errno::ENETUNREACH => ErrorKind::NetworkUnreachable,
             Errno::EHOSTUNREACH => ErrorKind::HostUnreachable,
+            // A TLS handshake or record that did not follow TLS 1.3: the
+            // connection is not usable, but nothing about the peer's identity
+            // was decided here (`EKEYREJECTED` is that answer).
+            Errno::EPROTO => ErrorKind::InvalidData,
+            // The server certificate was rejected by the kernel's fail-closed
+            // verification: no chain to the committed bundle, a SAN that does
+            // not authorize the name, a validity window the clock refuses, or a
+            // failed `CertificateVerify`. The peer is not who it claimed to be,
+            // which is a permission-shaped refusal rather than a broken stream.
+            Errno::EKEYREJECTED => ErrorKind::PermissionDenied,
             Errno::ENOTSOCK | Errno::EAFNOSUPPORT | Errno::EISCONN | Errno::Unknown => {
                 ErrorKind::Uncategorized
             }
