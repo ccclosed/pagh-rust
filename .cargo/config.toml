@@ -21,3 +21,11 @@ rustflags = [
     "-C", "link-arg=-T../pagh-api/pagh-user.ld",
     "-C", "linker=rust-lld",
 ]
+# All TLS dependencies are vendored (see `vendor/`), so the build is offline
+# and byte-reproducible: the tree contains the exact sources the lockfile
+# names. `libpagh` stays a path dependency on the sibling `pagh-api` checkout.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

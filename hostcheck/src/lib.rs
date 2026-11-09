@@ -39,6 +39,17 @@ mod hash_set;
 #[path = "../../pagh_std/src/lazy.rs"]
 mod lazy;
 
+// The 0.7.0 pure layers: the RFC 1035 codec the resolver speaks, the RFC 6125
+// hostname matcher the TLS verifier authorizes with, and the HTTP/1.1 head
+// parser the fetch uses. All three are `core` + `alloc` only, so they are
+// tested here with adversarial input instead of only against a live server.
+#[path = "../../pagh_std/src/net/dns_wire.rs"]
+mod dns_wire;
+#[path = "../../pagh_std/src/tls/hostname.rs"]
+mod hostname;
+#[path = "../../pagh_std/src/tls/http.rs"]
+mod http;
+
 #[cfg(test)]
 mod tests {
     use super::path::{normalize, normalize_join, Path, PathBuf};
@@ -131,39 +142,235 @@ mod tests {
         assert_eq!(path.as_str(), "/absolute/replaces");
     }
 
-    #[test]
-    fn hash_map_is_a_sorted_btree_shim() {
-        use super::hash_map::HashMap;
-        let mut map = HashMap::new();
-        map.insert("b", 2u32);
-        map.insert("a", 1);
-        assert_eq!(map.len(), 2);
-        assert_eq!(map.get("a"), Some(&1));
-        let keys: alloc::vec::Vec<&str> = map.keys().copied().collect();
-        assert_eq!(keys, ["a", "b"]);
+    /// A hasher that maps every key to the same bucket: the adversarial case
+    /// for linear probing, and the one a "real hash table" must survive.
+    #[derive(Clone, Copy, Default)]
+    struct ZeroHasher;
 
-        *map.entry("a").or_insert(0) += 10;
-        map.entry("c").or_insert(3);
-        assert_eq!(map.get("a"), Some(&11));
-        assert_eq!(map.get("c"), Some(&3));
-        assert!(map.remove("b").is_some());
-        assert!(!map.contains_key("b"));
-        map.retain(|_, value| *value > 2);
-        assert_eq!(map.len(), 2);
+    impl core::hash::BuildHasher for ZeroHasher {
+        type Hasher = ZeroHash;
+        fn build_hasher(&self) -> ZeroHash {
+            ZeroHash
+        }
+    }
+
+    struct ZeroHash;
+
+    impl core::hash::Hasher for ZeroHash {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, _bytes: &[u8]) {}
     }
 
     #[test]
-    fn hash_set_is_a_sorted_btree_shim() {
+    fn hash_map_is_a_real_hash_table() {
+        use super::hash_map::HashMap;
+        let mut map = HashMap::new();
+        assert!(map.is_empty());
+        assert_eq!(map.capacity(), 0);
+        map.insert("b", 2u32);
+        map.insert("a", 1);
+        map.insert("c", 3);
+        assert_eq!(map.len(), 3);
+        assert!(map.capacity() >= 3);
+        assert_eq!(map.get("a"), Some(&1));
+        assert_eq!(map.get("missing"), None);
+        // The stored key is the original, not the probe argument.
+        assert_eq!(map.get_key_value("b"), Some((&"b", &2)));
+        // Iteration reaches every entry exactly once (order is unspecified).
+        let mut keys: alloc::vec::Vec<&str> = map.keys().copied().collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["a", "b", "c"]);
+        let mut values: alloc::vec::Vec<u32> = map.values().copied().collect();
+        values.sort_unstable();
+        assert_eq!(values, [1, 2, 3]);
+
+        // insert replaces the value but keeps the original key.
+        assert_eq!(map.insert("a", 10), Some(1));
+        assert_eq!(map.get("a"), Some(&10));
+        assert_eq!(map.len(), 3);
+
+        *map.entry("a").or_insert(0) += 5;
+        let occupied_is_occupied = matches!(map.entry("a"), super::hash_map::Entry::Occupied(_));
+        assert!(occupied_is_occupied);
+        map.entry("d").or_insert(4);
+        map.entry("e").or_insert_with(|| 5);
+        map.entry("f").or_default();
+        map.entry("d").and_modify(|value| *value *= 2).or_insert(0);
+        assert_eq!(map.get("a"), Some(&15));
+        assert_eq!(map.get("d"), Some(&8));
+        assert_eq!(map.get("e"), Some(&5));
+        assert_eq!(map.get("f"), Some(&0));
+        assert_eq!(map.len(), 6);
+
+        assert_eq!(map.remove("b"), Some(2));
+        assert_eq!(map.remove("b"), None);
+        assert!(!map.contains_key("b"));
+        assert_eq!(map.get("c"), Some(&3));
+        assert_eq!(map.remove_entry("c"), Some(("c", 3)));
+        assert_eq!(map.len(), 4);
+
+        map.retain(|key, value| *value > 7 || *key == "f");
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["a"], 15);
+        assert_eq!(map["d"], 8);
+        assert_eq!(map["f"], 0);
+
+        // Drain empties the map and yields every entry.
+        let mut drained: alloc::vec::Vec<(alloc::string::String, u32)> = map
+            .drain()
+            .map(|(key, value)| (alloc::string::String::from(key), value))
+            .collect();
+        drained.sort_unstable();
+        assert_eq!(
+            drained,
+            [
+                (alloc::string::String::from("a"), 15),
+                (alloc::string::String::from("d"), 8),
+                (alloc::string::String::from("f"), 0),
+            ]
+        );
+        assert!(map.is_empty());
+        assert!(map.capacity() > 0, "drain keeps the allocation");
+    }
+
+    #[test]
+    fn hash_map_survives_every_key_in_one_bucket() {
+        use super::hash_map::HashMap;
+        // 256 keys, all hashing to bucket 0: insertion, lookup, removal and
+        // growth all have to walk a single long probe run.
+        let mut map: HashMap<u32, u32, ZeroHasher> = HashMap::with_hasher(ZeroHasher);
+        for key in 0..256u32 {
+            assert_eq!(map.insert(key, key * 3), None);
+        }
+        assert_eq!(map.len(), 256);
+        for key in 0..256u32 {
+            assert_eq!(map.get(&key), Some(&(key * 3)));
+        }
+        // Remove the first half, in order, forcing backward-shift deletion to
+        // close the hole from a run that never leaves its ideal slot.
+        for key in 0..128u32 {
+            assert_eq!(map.remove(&key), Some(key * 3));
+        }
+        assert_eq!(map.len(), 128);
+        for key in 0..128u32 {
+            assert_eq!(map.get(&key), None);
+        }
+        for key in 128..256u32 {
+            assert_eq!(map.get(&key), Some(&(key * 3)));
+        }
+        // Re-insert the removed half, then remove in reverse.
+        for key in 0..128u32 {
+            assert_eq!(map.insert(key, key * 3 + 1), None);
+        }
+        for key in (0..256u32).rev() {
+            assert_eq!(map.remove(&key).is_some(), true);
+        }
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn hash_map_grows_and_shrinks_with_every_entry_intact() {
+        use super::hash_map::HashMap;
+        use alloc::string::ToString;
+        let mut map: HashMap<alloc::string::String, usize> = HashMap::with_capacity(4);
+        for index in 0..1024usize {
+            map.insert(index.to_string(), index);
+        }
+        assert_eq!(map.len(), 1024);
+        assert!(map.capacity() >= 1024);
+        let capacity_before = map.capacity();
+        for index in 0..1024usize {
+            assert_eq!(map.get(&index.to_string()), Some(&index));
+        }
+        for index in (0..1024usize).step_by(2) {
+            assert_eq!(map.remove(&index.to_string()), Some(index));
+        }
+        assert_eq!(map.len(), 512);
+        map.shrink_to_fit();
+        assert!(map.capacity() < capacity_before);
+        assert!(map.capacity() >= 512);
+        for index in 0..1024usize {
+            let expected = if index % 2 == 0 { None } else { Some(&index) };
+            assert_eq!(map.get(&index.to_string()), expected);
+        }
+        // Cloning copies every entry and both maps stay independent.
+        let clone = map.clone();
+        assert_eq!(clone, map);
+        map.clear();
+        assert!(map.is_empty());
+        assert_eq!(clone.len(), 512);
+    }
+
+    #[test]
+    fn hash_map_mutators_and_iterators_agree() {
+        use super::hash_map::HashMap;
+        let mut map: HashMap<u32, u32> = (0..64u32).map(|key| (key, key)).collect();
+        for (_, value) in map.iter_mut() {
+            *value += 1;
+        }
+        for value in map.values_mut() {
+            *value *= 2;
+        }
+        let mut pairs: alloc::vec::Vec<(u32, u32)> = map.iter().map(|(k, v)| (*k, *v)).collect();
+        pairs.sort_unstable();
+        assert_eq!(pairs.len(), 64);
+        assert!(pairs.iter().all(|(key, value)| *value == (key + 1) * 2));
+        let owned: HashMap<u32, u32> = map.clone().into_iter().collect();
+        assert_eq!(owned, map);
+        let mut reserved: HashMap<u32, u32> = HashMap::new();
+        reserved.reserve(1000);
+        assert!(reserved.capacity() >= 1000);
+        assert!(reserved.try_reserve(10).is_ok());
+    }
+
+    #[test]
+    fn hash_set_is_a_real_hash_set() {
         use super::hash_set::HashSet;
         let mut set = HashSet::new();
+        assert!(set.is_empty());
         assert!(set.insert("b"));
         assert!(set.insert("a"));
         assert!(!set.insert("a"));
-        let items: alloc::vec::Vec<&str> = set.iter().copied().collect();
+        assert_eq!(set.len(), 2);
+        assert!(set.capacity() >= 2);
+        let mut items: alloc::vec::Vec<&str> = set.iter().copied().collect();
+        items.sort_unstable();
         assert_eq!(items, ["a", "b"]);
+        assert_eq!(set.get("a"), Some(&"a"));
+        assert_eq!(set.get("missing"), None);
         assert!(set.contains("b"));
-        assert!(set.remove("b"));
+        assert_eq!(set.take("b"), Some("b"));
         assert!(!set.contains("b"));
+        assert!(!set.remove("b"));
+        assert_eq!(set.replace("a"), Some("a"));
+        assert_eq!(set.replace("c"), None);
+        assert_eq!(set.len(), 2);
+
+        let other: HashSet<&str> = ["c", "d"].into_iter().collect();
+        let mut union: alloc::vec::Vec<&str> = set.union(&other).copied().collect();
+        union.sort_unstable();
+        assert_eq!(union, ["a", "c", "d"]);
+        let mut difference: alloc::vec::Vec<&str> = set.difference(&other).copied().collect();
+        difference.sort_unstable();
+        assert_eq!(difference, ["a"]);
+        let mut intersection: alloc::vec::Vec<&str> = set.intersection(&other).copied().collect();
+        intersection.sort_unstable();
+        assert_eq!(intersection, ["c"]);
+        let mut symmetric: alloc::vec::Vec<&str> =
+            set.symmetric_difference(&other).copied().collect();
+        symmetric.sort_unstable();
+        assert_eq!(symmetric, ["a", "d"]);
+        assert!(!set.is_subset(&other));
+        assert!(!set.is_disjoint(&other));
+        assert!(set.is_superset(&["a", "c"].into_iter().collect::<HashSet<&str>>()));
+
+        set.retain(|item| *item != "a");
+        assert_eq!(set.len(), 1);
+        let drained: alloc::vec::Vec<&str> = set.drain().collect();
+        assert_eq!(drained, ["c"]);
+        assert!(set.is_empty());
     }
 
     #[test]
@@ -209,5 +416,200 @@ mod tests {
         assert_eq!(path.to_string_lossy(), "/mnt/привет");
         assert_eq!(alloc::format!("{}", path), "/mnt/привет");
         assert_eq!(alloc::format!("{:?}", path), "\"/mnt/привет\"");
+    }
+}
+
+/// The 0.7.0 pure layers, driven directly: no socket, no clock, no server.
+#[cfg(test)]
+mod pure_070 {
+    use super::dns_wire::{self, WireError};
+    use super::hostname::{hostname_matches, ip_matches, is_ip_literal, parse_ipv4_literal};
+    use super::http::{
+        build_get_request, parse_http_head, ChunkProgress, ChunkedDecoder, HeadParse,
+    };
+
+    #[test]
+    fn dns_query_encodes_and_the_answer_decodes() {
+        let mut query = [0u8; 512];
+        let length = dns_wire::encode_query("example.com", 0x4242, &mut query).unwrap();
+        assert_eq!(u16::from_be_bytes([query[0], query[1]]), 0x4242);
+        // RD set, QR clear, one question.
+        assert_eq!(query[2], 0x01);
+        assert_eq!(u16::from_be_bytes([query[4], query[5]]), 1);
+        let (name, after) = dns_wire::decode_name(&query, 12).unwrap();
+        assert_eq!(name, "example.com");
+        assert_eq!(after, length - 4);
+    }
+
+    #[test]
+    fn dns_names_are_refused_before_they_are_sent() {
+        let mut out = [0u8; 512];
+        // A single trailing dot (the FQDN root) is accepted and stripped; a
+        // bare "-" is a legal RFC 1035 label even if no host is named that.
+        for name in ["", ".", "a..b", "x".repeat(64).as_str(), "пример.рф", "a/b"] {
+            assert!(
+                dns_wire::encode_query(name, 1, &mut out).is_err(),
+                "{name:?}"
+            );
+        }
+        assert!(dns_wire::encode_query(&"x".repeat(63), 1, &mut out).is_ok());
+    }
+
+    #[test]
+    fn dns_replies_are_matched_before_they_are_trusted() {
+        // A NOERROR answer for example.com built by hand, then mutated into the
+        // three shapes that must never be accepted.
+        let mut message = alloc::vec![0u8; 12 + 17 + 16];
+        message[0..2].copy_from_slice(&7u16.to_be_bytes());
+        message[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+        message[4..6].copy_from_slice(&1u16.to_be_bytes());
+        message[6..8].copy_from_slice(&1u16.to_be_bytes());
+        let mut offset = 12;
+        offset += dns_wire::encode_name("example.com", &mut message[offset..]).unwrap();
+        message[offset..offset + 2].copy_from_slice(&dns_wire::TYPE_A.to_be_bytes());
+        message[offset + 2..offset + 4].copy_from_slice(&dns_wire::CLASS_IN.to_be_bytes());
+        offset += 4;
+        message[offset] = 0xC0;
+        message[offset + 1] = 12;
+        message[offset + 2..offset + 4].copy_from_slice(&dns_wire::TYPE_A.to_be_bytes());
+        message[offset + 4..offset + 6].copy_from_slice(&dns_wire::CLASS_IN.to_be_bytes());
+        message[offset + 6..offset + 10].copy_from_slice(&60u32.to_be_bytes());
+        message[offset + 10..offset + 12].copy_from_slice(&4u16.to_be_bytes());
+        message[offset + 12..offset + 16].copy_from_slice(&[203, 0, 113, 7]);
+        message.truncate(offset + 16);
+
+        let response = dns_wire::parse_response(&message, 7, "example.com").unwrap();
+        assert_eq!(response.addresses[0].address, [203, 0, 113, 7]);
+        assert_eq!(response.addresses[0].ttl, 60);
+        assert!(!response.truncated);
+
+        assert_eq!(
+            dns_wire::parse_response(&message, 8, "example.com"),
+            Err(WireError::NotAResponse)
+        );
+        assert_eq!(
+            dns_wire::parse_response(&message, 7, "example.org"),
+            Err(WireError::QuestionMismatch)
+        );
+        let mut looping = message.clone();
+        looping[12] = 0xC0;
+        looping[13] = 12; // a pointer to itself: never a legal compression
+        assert_eq!(
+            dns_wire::parse_response(&looping, 7, "example.com"),
+            Err(WireError::BadPointer)
+        );
+        for length in 0..message.len() {
+            assert!(
+                dns_wire::parse_response(&message[..length], 7, "example.com").is_err(),
+                "accepted a {length}-byte prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn hostname_matching_is_rfc_6125_without_cn_fallback() {
+        assert!(hostname_matches(b"example.com", b"example.com"));
+        assert!(hostname_matches(b"EXAMPLE.com", b"example.com"));
+        assert!(hostname_matches(b"example.com", b"example.com."));
+        assert!(hostname_matches(b"a.example.com", b"*.example.com"));
+        assert!(!hostname_matches(b"example.com", b"*.example.com"));
+        assert!(!hostname_matches(b"b.a.example.com", b"*.example.com"));
+        assert!(!hostname_matches(b"a.example.com", b"w*.example.com"));
+        assert!(!hostname_matches(b"example.com", b"other.com"));
+        assert!(!hostname_matches(b"example.com", b""));
+        // `ip_matches` compares raw octets: the caller parses the literal first
+        // (`parse_ipv4_literal`), exactly as `tls_auth` does.
+        assert!(ip_matches(
+            &parse_ipv4_literal(b"203.0.113.7").unwrap(),
+            b"\xcb\x00\x71\x07"
+        ));
+        assert!(!ip_matches(
+            &parse_ipv4_literal(b"203.0.113.7").unwrap(),
+            b"\xcb\x00\x71\x08"
+        ));
+        assert!(!ip_matches(b"203.0.113.7", b"\xcb\x00\x71\x07"));
+        assert!(hostname_matches(b"203.0.113.7", b"203.0.113.7"));
+        assert!(is_ip_literal(b"203.0.113.7"));
+        assert!(!is_ip_literal(b"example.com"));
+        assert_eq!(parse_ipv4_literal(b"203.0.113.7"), Some([203, 0, 113, 7]));
+        assert_eq!(parse_ipv4_literal(b"203.0.113"), None);
+    }
+
+    #[test]
+    fn http_head_parsing_is_bounded_and_typed() {
+        assert_eq!(parse_http_head(b"HTTP/1.1 200 OK\r\n"), HeadParse::Need);
+        let HeadParse::Done {
+            status,
+            content_length,
+            body_off,
+            chunked,
+        } = parse_http_head(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX: y\r\n\r\nhello")
+        else {
+            panic!("complete head was not parsed");
+        };
+        assert_eq!((status, content_length, chunked), (200, Some(5), false));
+        assert_eq!(
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX: y\r\n\r\nhello"[body_off..],
+            b"hello"
+        );
+        assert!(matches!(
+            parse_http_head(b"not http at all\r\n\r\n"),
+            HeadParse::Malformed
+        ));
+
+        let request = build_get_request("example.com", "/");
+        assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+        assert!(core::str::from_utf8(&request)
+            .unwrap()
+            .contains("Host: example.com\r\n"));
+
+        let mut decoder = ChunkedDecoder::new(1024);
+        assert_eq!(decoder.push(b"5\r\nhello\r\n"), ChunkProgress::Need);
+        assert_eq!(decoder.push(b"0\r\n\r\n"), ChunkProgress::Done);
+        assert_eq!(decoder.body(), b"hello");
+    }
+}
+
+#[cfg(test)]
+mod set_probe_release {
+    use super::hash_set::HashSet;
+
+    #[test]
+    fn a_set_is_always_disjoint_from_the_empty_set() {
+        let mut set: HashSet<&str> = HashSet::new();
+        set.insert("a");
+        set.insert("b");
+        set.insert("a");
+        let mut other: HashSet<&str> = HashSet::new();
+        other.insert("b");
+        other.insert("c");
+        let union: HashSet<&str> = set.union(&other).copied().collect();
+        let intersection: HashSet<&str> = set.intersection(&other).copied().collect();
+        let difference: HashSet<&str> = set.difference(&other).copied().collect();
+        let symmetric: HashSet<&str> = set.symmetric_difference(&other).copied().collect();
+        // The exact expression the `hash_map` example evaluates — including the
+        // negations. It was written without one on `is_disjoint` first, which
+        // made the live check fail while every part of it looked right; this
+        // test is the regression that keeps the shape honest.
+        let condition = set.len() != 2
+            || !set.contains("a")
+            || union.len() != 3
+            || intersection.len() != 1
+            || difference.len() != 1
+            || symmetric.len() != 2
+            || !set.is_subset(&union)
+            || !set.is_disjoint(&HashSet::new());
+        assert!(
+            !condition,
+            "len={} has_a={} union={} inter={} diff={} sym={} subset={} disjoint={}",
+            set.len(),
+            set.contains("a"),
+            union.len(),
+            intersection.len(),
+            difference.len(),
+            symmetric.len(),
+            set.is_subset(&union),
+            set.is_disjoint(&HashSet::new()),
+        );
     }
 }

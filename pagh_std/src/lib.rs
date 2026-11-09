@@ -12,13 +12,16 @@
 //!
 //! `pagh_std` therefore does not claim to be `std`. It claims something
 //! narrower and testable: file I/O, directories, arguments/environment,
-//! monotonic time, paths, buffered I/O, formatting, exit codes, **native
-//! threads/futexes and scoped threads** ([`thread`]), **mutexes, rwlocks,
-//! condition variables, a bounded channel, barriers and `Once`** ([`sync`]),
-//! the ABI's IPv4 sockets — **a TCP client, a TCP listener and UDP
-//! datagrams** ([`net`]) — and **signals** ([`signal`]). Operations the ABI
-//! cannot express (`fsync`, `O_EXCL`, `dup`, `OsStr`, dynamic linking) remain
-//! typed `Unsupported` errors instead of silent stubs.
+//! monotonic time, paths, buffered I/O, formatting, exit codes, **a real
+//! open-addressing hash table** ([`collections`]), **native threads/futexes and
+//! scoped threads** ([`thread`]), **mutexes, rwlocks, condition variables, a
+//! bounded channel, barriers and `Once`** ([`sync`]), the ABI's IPv4 sockets —
+//! **a TCP client, a TCP listener, UDP datagrams, a DNS stub resolver and
+//! `connect("host:port")`** ([`net`]) — **TLS 1.3 with fail-closed server
+//! authentication** ([`tls`]) and **signals** ([`signal`]). Operations the ABI
+//! cannot express (`fsync`, `O_EXCL`, `dup`, `OsStr`, dynamic linking, a
+//! per-descriptor non-blocking flag) remain typed `Unsupported` errors instead
+//! of silent stubs.
 //!
 //! # Program shape
 //!
@@ -54,11 +57,16 @@
 //! * absolute kernel paths, maximum 256 bytes;
 //! * console `read(0)` is non-blocking and has no EOF (the `io::Stdin` handle
 //!   hides the non-blocking part by yielding, but EOF never arrives);
-//! * no `statat`, `O_EXCL`, `O_DIRECTORY`, `O_NOFOLLOW`, `fsync`, `dup`,
-//!   RTC or dynamic linker;
-//! * IPv4 only (no DNS/TLS in this layer): one active-open TCP client at a
-//!   time, one listener with a four-entry accept queue, eight TCP connections
-//!   and eight bound UDP ports, and a 1024-byte UDP datagram ceiling.
+//! * no `statat`, `O_EXCL`, `O_DIRECTORY`, `O_NOFOLLOW`, `fsync`, `dup` on a
+//!   socket, RTC or dynamic linker — and **no entropy source at all**;
+//! * IPv4 only: one active-open TCP client at a time, one listener with a
+//!   four-entry accept queue, eight TCP connections and eight bound UDP ports,
+//!   and a 1024-byte UDP datagram ceiling;
+//! * DNS is the SDK's own stub resolver ([`net::dns`]), because the ABI has no
+//!   resolver call and cannot report the DHCP lease;
+//! * TLS ([`tls`]) requires a wall clock and 32 bytes of entropy **from the
+//!   caller**: `clock_gettime(CLOCK_REALTIME)` is the uptime counter here and
+//!   there is no `getrandom`.
 //!
 //! # Modules
 //!
@@ -70,10 +78,11 @@
 //! | [`process`] | `exit`, `abort`, `id`, `fork`/`execve`/`wait`, `Command` spawn/status/output |
 //! | [`time`] | `Duration`, monotonic `Instant`, uptime-based `SystemTime`, `UNIX_EPOCH`, `sleep`, `sleep_until` |
 //! | [`path`] | `Path`, `PathBuf`, `Component`, `Components`, lexical `normalize`/`normalize_join` |
-//! | [`collections`] | `Vec`, `String`, `VecDeque`, `BTreeMap`, `BTreeSet`, `BinaryHeap`, `HashMap`/`HashSet` shims |
+//! | [`collections`] | `Vec`, `String`, `VecDeque`, `BTreeMap`, `BTreeSet`, `BinaryHeap`, a real `HashMap`/`HashSet` |
 //! | [`sync`] | `Cell`, `RefCell`, `OnceCell`, `LazyLock`, futex-backed `Mutex`/`RwLock`/`Condvar`/`Barrier`/`Once`, bounded `mpsc` |
 //! | [`thread`] | native `Builder`/`JoinHandle`, futex wait/wake, `thread::scope` with borrowed closures |
-//! | [`net`] | `Ipv4`, `SocketAddr`, `TcpStream` (blocking `Read`/`Write`/`BufRead`), `TcpListener`, `UdpSocket` |
+//! | [`net`] | `Ipv4`, `SocketAddr`, `TcpStream` (blocking/`WouldBlock`, timeouts, `try_clone`), `TcpListener`, `UdpSocket`, `dns`, `connect("host:port")` |
+//! | [`tls`] | TLS 1.3 over a `TcpStream`: fail-closed verification, committed CA bundle, `https_get` |
 //! | [`fmt`] | `core::fmt` re-exports; `print!`, `println!`, `eprint!`, `eprintln!`, `dbg!`, `format!`, `vec!`, `write!`, `writeln!` |
 //! | [`panic`] | `PanicInfo`, `abort`; the handler contract and why `libpagh` owns it |
 //! | [`ffi`] | `c_*` types and `CStr`/`CString` for a future C boundary |
@@ -110,6 +119,7 @@ pub mod signal;
 pub mod sync;
 pub mod thread;
 pub mod time;
+pub mod tls;
 
 pub use crate::error::{Error, ErrorKind};
 

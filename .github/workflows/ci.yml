@@ -74,6 +74,22 @@ jobs:
             test "$size" -le 1048576
           done
 
+      - name: Check the 0.7.0 examples against the 1 MiB limit (release)
+        working-directory: pagh-rust
+        # `tls_get` is release-only: the debug profile links the crypto
+        # backends unoptimized and the image is 1.19 MiB, over the kernel's
+        # limit. The live matrix (`tools/live_070.py`) runs release for the
+        # same reason, so that is the profile these four are gated in.
+        run: |
+          set -euo pipefail
+          ./build.sh --release
+          for elf in hash_map dns socket_opts tls_get; do
+            path="target/riscv64gc-unknown-none-elf/release/examples/$elf"
+            size=$(wc -c <"$path")
+            echo "$path: $size bytes"
+            test "$size" -le 1048576
+          done
+
       - name: Host tests for the pure path logic
         working-directory: pagh-rust
         run: cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu --locked
@@ -93,5 +109,9 @@ jobs:
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/tcp_server
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/udp_echo
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/sync_primitives
+            pagh-rust/target/riscv64gc-unknown-none-elf/release/examples/hash_map
+            pagh-rust/target/riscv64gc-unknown-none-elf/release/examples/dns
+            pagh-rust/target/riscv64gc-unknown-none-elf/release/examples/socket_opts
+            pagh-rust/target/riscv64gc-unknown-none-elf/release/examples/tls_get
           if-no-files-found: error
           retention-days: 14

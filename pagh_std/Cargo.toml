@@ -1,6 +1,6 @@
 [package]
 name = "pagh_std"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 publish = false
 description = "A std-like Rust layer over the pagh-riscv native ABI (libpagh)"
@@ -17,6 +17,32 @@ libpagh = { path = "../../pagh-api/libpagh" }
 
 # The real programs live at the repository root (`examples/`) so the SDK and its
 # examples read like one project, not like test fixtures hidden inside the crate.
+# ─── TLS 1.3 (0.7.0) ────────────────────────────────────────────────────────
+# Vendored, byte-pinned crates (see `vendor/` + `.gitattributes`): the same
+# `embedded-tls` 0.19.0 the kernel links, carrying the same deliberate local
+# patch (`src/connection.rs` refuses `Finished` unless `Certificate` and
+# `CertificateVerify` preceded it — see the README's TLS section), plus the
+# verify-only crypto backends the ported chain verifier dispatches on.
+# `default-features = false` everywhere: no std, no log, no tokio; `alloc`
+# routes embedded-tls's record buffers through the SDK's heap.
+embedded-tls = { version = "=0.19.0", default-features = false, features = ["alloc"] }
+embedded-io = { version = "=0.7.1", default-features = false }
+embedded-io-async = { version = "=0.7.0", default-features = false }
+# The handshake RNG trait (`RngCore` + `CryptoRng`).
+rand_chacha = { version = "=0.3.1", default-features = false }
+rand_core = { version = "=0.6.4", default-features = false }
+# Chain/signature verification backends (verify-only, no key generation):
+# RSASSA-PKCS1-v1_5 (rsa), ECDSA P-384 (p384), Ed25519 (ed25519-dalek), the
+# SHA-2 digests the X.509 layer hashes with, ECDSA P-256 and the `Verifier`
+# trait shared by all of them.
+rsa = { version = "=0.9.9", default-features = false, features = ["sha2"] }
+p384 = { version = "=0.13.0", default-features = false, features = ["ecdsa", "sha384"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast"] }
+sha2 = { version = "=0.10.9", default-features = false, features = ["oid"] }
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa"] }
+signature = { version = "=2.2.0", default-features = false }
+const-oid = { version = "=0.9.6", default-features = false }
+
 [[example]]
 name = "cat"
 path = "../examples/cat.rs"
@@ -55,3 +81,19 @@ path = "../examples/udp_echo.rs"
 [[example]]
 name = "sync_primitives"
 path = "../examples/sync_primitives.rs"
+
+[[example]]
+name = "hash_map"
+path = "../examples/hash_map.rs"
+
+[[example]]
+name = "dns"
+path = "../examples/dns.rs"
+
+[[example]]
+name = "socket_opts"
+path = "../examples/socket_opts.rs"
+
+[[example]]
+name = "tls_get"
+path = "../examples/tls_get.rs"

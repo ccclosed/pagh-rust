@@ -1,12 +1,16 @@
-//! IPv4 sockets: a TCP client, a TCP listener and UDP datagrams.
+//! IPv4 sockets: a TCP client, a TCP listener, UDP datagrams and a stub DNS
+//! resolver.
 //!
-//! The pagh ABI has no DNS, no IPv6 and no TLS in this layer: an address is an
-//! [`Ipv4`] literal, or a [`SocketAddr`] built from one. Ports are `u16`.
+//! An address is an [`Ipv4`] literal or a [`SocketAddr`] built from one; a name
+//! is resolved by [`dns`] (RFC 1035 over a [`UdpSocket`]), which is the SDK's own
+//! layer because the ABI has no resolver call — see [`dns`] for where the server
+//! address comes from and [`TcpStream::connect_host`] / [`connect`] for the
+//! `host:port` entry points. IPv6 does not exist in this ABI.
 //!
-//! The three socket types are `pagh_std`'s own wrappers over `libpagh`'s
-//! syscall layer (`libpagh::sys::{socket, bind, listen, accept, connect,
-//! sendto, recvfrom, shutdown, close}`), for two reasons the SDK can state
-//! plainly:
+//! The socket types are `pagh_std`'s own wrappers over `libpagh`'s syscall
+//! layer (`libpagh::sys::{socket, bind, listen, accept, connect, sendto,
+//! recvfrom, shutdown, close}` plus the two options calls `libpagh` does not
+//! wrap yet), for three reasons the SDK can state plainly:
 //!
 //! * the ABI has **no `getsockname`**, so the address a socket was bound to is
 //!   only knowable if the caller remembers the argument — the wrappers keep it
@@ -14,7 +18,10 @@
 //! * the ABI's `recv` is non-blocking while `std`'s is blocking, and a
 //!   listener is either created `SOCK_NONBLOCK` or not created at all. Owning
 //!   the descriptor lets one type present both the blocking and the
-//!   `WouldBlock` shape without a second constructor.
+//!   `WouldBlock` shape without a second constructor;
+//! * `SO_RCVTIMEO`/`SO_SNDTIMEO` are accepted and ignored by the kernel, so a
+//!   timeout that a program can actually observe has to be enforced here
+//!   ([`TcpStream::set_read_timeout`], [`UdpSocket::set_read_timeout`]).
 //!
 //! # Blocking contract
 //!
@@ -28,30 +35,40 @@
 //!
 //! The `*_nonblocking` / `try_*` methods and `set_nonblocking(true)` are the
 //! single-poll shapes: they return [`ErrorKind::WouldBlock`] when there is
-//! nothing to report.
+//! nothing to report. A read deadline makes the wait end in
+//! [`ErrorKind::WouldBlock`] too, exactly as `std` documents for
+//! `set_read_timeout`.
 //!
 //! # What the ABI cannot do
 //!
-//! No DNS, no IPv6, no `getsockname`/`getpeername` (the peer address is
-//! remembered from `connect`/`accept` instead), no `fcntl`, so a
-//! [`TcpStream`] has no `set_nonblocking`, no `TcpStream::try_clone`, no
-//! socket options, no `SO_REUSEADDR`, no half-close, and no way to learn an
-//! ephemeral port chosen by `bind(0)`. The kernel's own limits apply: one
-//! active-open TCP client at a time, one listener with a four-entry accept
-//! queue, eight TCP connections, eight bound UDP ports, a 1024-byte UDP
-//! datagram ceiling, and sixteen file descriptors per process.
+//! No IPv6, no `getsockname`/`getpeername` (the peer address is remembered from
+//! `connect`/`accept` instead), no `fcntl`, no half-close, and no way to learn
+//! an ephemeral port chosen by `bind(0)`. `setsockopt` exists but is a
+//! validated no-op, so [`TcpStream::set_reuseaddr`] reports the ABI's answer
+//! without promising address reuse. `dup` refuses sockets, so
+//! [`TcpStream::try_clone`] shares one descriptor instead of duplicating it.
+//! The kernel's own limits apply: one active-open TCP client at a time, one
+//! listener with a four-entry accept queue, eight TCP connections, eight bound
+//! UDP ports, a 1024-byte UDP datagram ceiling, and sixteen file descriptors
+//! per process.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::fmt;
 use core::str::FromStr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use libpagh::abi::SockAddrIn;
+use libpagh::abi::{PollFd, SockAddrIn};
 use libpagh::errno::Errno;
 use libpagh::sys;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::io::{BufRead, Read, ReadBuffer, Write};
+use crate::time::{Duration, Instant};
+
+pub mod dns;
+pub mod dns_wire;
 
 pub use libpagh::net::Ipv4;
 
@@ -172,44 +189,97 @@ fn would_block(errno: Errno) -> bool {
 
 // ─── TcpStream ──────────────────────────────────────────────────────────────
 
+/// The descriptor a [`TcpStream`] shares with its clones.
+///
+/// WHY AN `Arc` AND NOT `dup`: the ABI's `dup(23)` refuses sockets. A second
+/// descriptor for one connection would be a second owner without a reference
+/// count, so the kernel maps it to `Unsupported` (`FdEntry::Unsupported` in
+/// `src/user/syscall.rs`, "A dup/fork of a socket would be a second owner of one
+/// connection or binding"). [`TcpStream::try_clone`] therefore shares this
+/// handle instead: both values read and write the same socket, and the
+/// descriptor is closed when the last handle drops.
+struct StreamHandle {
+    fd: i32,
+}
+
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        let _ = sys::close(self.fd);
+    }
+}
+
+/// The SDK's per-handle stream policy.
+///
+/// The ABI has no `fcntl`, so it cannot flip a descriptor to non-blocking after
+/// creation, and its `SO_RCVTIMEO`/`SO_SNDTIMEO` are *validated and ignored*
+/// (the kernel's `setsockopt` comment: "This kernel has nothing to tune"). The
+/// timeout and non-blocking behaviour therefore lives here and is enforced
+/// around the ABI's `EAGAIN` contract, which is real: stream `recv` is
+/// non-blocking by contract and answers `-EAGAIN` when nothing is queued.
+#[derive(Clone, Copy, Default)]
+struct StreamPolicy {
+    nonblocking: bool,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
+}
+
 /// A connected TCP stream (one `AF_INET`/`SOCK_STREAM` descriptor).
 ///
-/// Dropping the value calls `close`; a close error is ignored, because there is
-/// nothing useful to do with it and the kernel releases the connection anyway.
-/// [`TcpStream::shutdown`] closes the connection but keeps the descriptor open
-/// for a final `read` (which returns `Ok(0)`, end of stream).
+/// Dropping the value closes the descriptor — unless a [`try_clone`] handle is
+/// still alive, in which case the connection stays open until the last handle
+/// drops. [`TcpStream::shutdown`] closes the connection but keeps the descriptor
+/// open for a final `read` (which returns `Ok(0)`, end of stream).
 ///
 /// [`Read`]/[`Write`] block by retrying the ABI's non-blocking `recv`/`send`
 /// with `sched_yield`, which is the std-shaped contract. [`BufRead`] adds an
-/// 8 KiB read-ahead buffer allocated on first use.
+/// 8 KiB read-ahead buffer allocated on first use; the read-ahead is per handle
+/// and is *not* shared with a [`try_clone`], so bytes buffered before the clone
+/// stay with the original handle.
+///
+/// [`try_clone`]: TcpStream::try_clone
 pub struct TcpStream {
-    fd: i32,
-    open: bool,
+    handle: Arc<StreamHandle>,
     peer: SocketAddr,
     read_ahead: ReadBuffer,
+    policy: Cell<StreamPolicy>,
 }
 
 impl TcpStream {
     /// Open a connection to `host:port`, completing the TCP handshake.
     ///
-    /// IPv4 literals only: there is no DNS in this ABI. The kernel's own
-    /// deadline bounds the wait; a refusal is `ECONNREFUSED`, no lease or no
-    /// route `ENETUNREACH`, a silent peer `ETIMEDOUT`. This is the ABI's one
-    /// active-open client: a second `connect` while this stream is open is
-    /// `ENOSPC` until it is dropped (accepted server connections have their
-    /// own descriptors and are not affected).
+    /// IPv4 literals only — use [`TcpStream::connect_host`] or
+    /// [`crate::net::connect`] for a name. The kernel's own deadline bounds the
+    /// wait; a refusal is `ECONNREFUSED`, no lease or no route `ENETUNREACH`, a
+    /// silent peer `ETIMEDOUT`. This is the ABI's one active-open client: a
+    /// second `connect` while this stream is open is `ENOSPC` until it is
+    /// dropped (accepted server connections have their own descriptors and are
+    /// not affected).
     pub fn connect(host: Ipv4, port: u16) -> Result<TcpStream> {
         let fd = sys::socket(sys::AF_INET, sys::SOCK_STREAM, 0)?;
         let stream = TcpStream {
-            fd,
-            open: true,
+            handle: Arc::new(StreamHandle { fd }),
             peer: SocketAddr::new(host, port),
             read_ahead: ReadBuffer::new(),
+            policy: Cell::new(StreamPolicy::default()),
         };
         // On error `stream` drops here, which closes the fresh descriptor
         // before the error reaches the caller.
         sys::connect(fd, &sockaddr_in_of(stream.peer))?;
         Ok(stream)
+    }
+
+    /// Open a connection to `host:port`, resolving `host` first.
+    ///
+    /// A dotted-quad IPv4 literal is used directly (no query is sent). Anything
+    /// else goes through [`dns::resolve`], which is the ABI's own DNS gap: the
+    /// SDK speaks RFC 1035 over a [`UdpSocket`] because the kernel exposes no
+    /// resolver syscall and no way to read the DHCP lease (see [`dns`]).
+    pub fn connect_host(host: &str, port: u16) -> Result<TcpStream> {
+        let address = match Ipv4::parse(host) {
+            Some(literal) => literal,
+            None => dns::resolve(host)?,
+        };
+        TcpStream::connect(address, port)
     }
 
     /// Wrap a descriptor the kernel returned from `accept`.
@@ -218,16 +288,16 @@ impl TcpStream {
     /// `getpeername`.
     fn from_accepted(fd: i32, peer: SocketAddr) -> TcpStream {
         TcpStream {
-            fd,
-            open: true,
+            handle: Arc::new(StreamHandle { fd }),
             peer,
             read_ahead: ReadBuffer::new(),
+            policy: Cell::new(StreamPolicy::default()),
         }
     }
 
     /// The underlying socket descriptor.
-    pub const fn fd(&self) -> i32 {
-        self.fd
+    pub fn fd(&self) -> i32 {
+        self.handle.fd
     }
 
     /// The peer's address, as passed to [`TcpStream::connect`] or returned by
@@ -243,7 +313,7 @@ impl TcpStream {
     /// keeping the descriptor. A later `read` returns `Ok(0)`, a later `write`
     /// is `EPIPE`; dropping the stream releases the descriptor.
     pub fn shutdown(&mut self) -> Result<()> {
-        sys::shutdown(self.fd, sys::SHUT_RDWR)?;
+        sys::shutdown(self.handle.fd, sys::SHUT_RDWR)?;
         Ok(())
     }
 
@@ -269,39 +339,150 @@ impl TcpStream {
     pub fn buffered(&self) -> &[u8] {
         self.read_ahead.buffered()
     }
+
+    /// Switch the SDK's read/write policy between blocking and single-shot.
+    ///
+    /// This is SDK state, not a descriptor flag: the ABI has no `fcntl` and the
+    /// non-blocking bit is fixed by `socket()` (a stream `recv` is
+    /// non-blocking by contract and answers `-EAGAIN` when nothing is queued, so
+    /// the mode is which of the two answers the SDK turns that into). In
+    /// non-blocking mode a read or write with nothing to do returns
+    /// [`ErrorKind::WouldBlock`] immediately instead of yielding and retrying.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        let mut policy = self.policy.get();
+        policy.nonblocking = nonblocking;
+        self.policy.set(policy);
+        Ok(())
+    }
+
+    /// Whether reads and writes are in the non-blocking mode.
+    pub fn is_nonblocking(&self) -> bool {
+        self.policy.get().nonblocking
+    }
+
+    /// Bound a read with a deadline, or clear it with `None`.
+    ///
+    /// Two things happen, and they are different claims:
+    ///
+    /// * the ABI's `setsockopt(SO_RCVTIMEO)` is issued and its answer is
+    ///   returned — a kernel that does not know the option is a typed
+    ///   [`ErrorKind::Unsupported`] rather than a silent success;
+    /// * the SDK enforces the deadline itself in the read path. It has to: the
+    ///   kernel's `setsockopt` validates the buffer and **ignores the value**
+    ///   ("the two timeouts read back as zero (the kernel's bounds are fixed)"),
+    ///   so the deadline is the only thing that can make a read return early.
+    ///
+    /// On timeout the read fails with [`ErrorKind::WouldBlock`], matching
+    /// `std::net::TcpStream`'s documented behaviour for `set_read_timeout`.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+        set_socket_timeout(self.handle.fd, SO_RCVTIMEO, timeout)?;
+        let mut policy = self.policy.get();
+        policy.read_timeout = timeout;
+        self.policy.set(policy);
+        Ok(())
+    }
+
+    /// The read deadline the SDK will enforce, if any.
+    pub fn read_timeout(&self) -> Option<Duration> {
+        self.policy.get().read_timeout
+    }
+
+    /// Bound a write with a deadline, or clear it with `None`.
+    ///
+    /// The same split as [`set_read_timeout`](TcpStream::set_read_timeout):
+    /// `SO_SNDTIMEO` is issued to the kernel, the deadline is enforced by the
+    /// SDK, and a timeout is [`ErrorKind::WouldBlock`].
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+        set_socket_timeout(self.handle.fd, SO_SNDTIMEO, timeout)?;
+        let mut policy = self.policy.get();
+        policy.write_timeout = timeout;
+        self.policy.set(policy);
+        Ok(())
+    }
+
+    /// The write deadline the SDK will enforce, if any.
+    pub fn write_timeout(&self) -> Option<Duration> {
+        self.policy.get().write_timeout
+    }
+
+    /// Issue `setsockopt(SO_REUSEADDR)` on this socket.
+    ///
+    /// The call is real and its answer is the kernel's, but the *behaviour* is
+    /// not: this kernel validates `SO_REUSEADDR` and ignores it ("the options a
+    /// BSD client commonly sets … are validated and ignored"), because ports are
+    /// reserved at `bind` and no `TIME_WAIT` reuse policy exists. On a kernel
+    /// that answered `-ENOPROTOOPT` this returns
+    /// [`ErrorKind::Unsupported`]; here it returns `Ok(())` and a second `bind`
+    /// of the same port still fails. The live transcript asserts both facts.
+    pub fn set_reuseaddr(&self, reuse: bool) -> Result<()> {
+        set_reuseaddr(self.handle.fd, reuse)
+    }
+
+    /// What the kernel reports for `getsockopt(SO_TYPE)`.
+    ///
+    /// A real round trip through the options ABI, and the one option whose
+    /// answer is not a no-op: it is how the live transcript shows the option
+    /// path works at all (`Stream` for this type, `Datagram` for a
+    /// [`UdpSocket`]).
+    pub fn socket_type(&self) -> Result<SocketType> {
+        socket_type_of(self.handle.fd)
+    }
+
+    /// Share this socket with a second handle.
+    ///
+    /// **Not** `std`'s `try_clone`: std `dup`s the descriptor, while this ABI
+    /// refuses to duplicate a socket, so the two handles share one descriptor
+    /// and the connection closes when the last one drops. Reads and writes
+    /// interleave on the same socket exactly as they would with a real `dup`;
+    /// the difference is that dropping one handle does not close the descriptor
+    /// out from under the other. The read-ahead buffer and the timeout /
+    /// non-blocking policy are per handle, and bytes already buffered in the
+    /// original's read-ahead are not visible to the clone.
+    pub fn try_clone(&self) -> Result<TcpStream> {
+        Ok(TcpStream {
+            handle: Arc::clone(&self.handle),
+            peer: self.peer,
+            read_ahead: ReadBuffer::new(),
+            policy: Cell::new(self.policy.get()),
+        })
+    }
 }
 
 impl core::fmt::Debug for TcpStream {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TcpStream")
-            .field("fd", &self.fd)
+            .field("fd", &self.handle.fd)
             .field("peer", &self.peer)
+            .field("nonblocking", &self.is_nonblocking())
             .finish()
-    }
-}
-
-impl Drop for TcpStream {
-    fn drop(&mut self) {
-        if self.open {
-            let _ = sys::close(self.fd);
-            self.open = false;
-        }
     }
 }
 
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let Self { fd, read_ahead, .. } = self;
-        let fd = *fd;
-        read_ahead.read(buf, |out| recv_blocking(fd, out))
+        let Self {
+            handle,
+            read_ahead,
+            policy,
+            ..
+        } = self;
+        let fd = handle.fd;
+        let policy = policy.get();
+        read_ahead.read(buf, |out| recv_with(fd, out, policy))
     }
 }
 
 impl BufRead for TcpStream {
     fn fill_buf(&mut self) -> Result<&[u8]> {
-        let Self { fd, read_ahead, .. } = self;
-        let fd = *fd;
-        read_ahead.fill(|out| recv_blocking(fd, out))
+        let Self {
+            handle,
+            read_ahead,
+            policy,
+            ..
+        } = self;
+        let fd = handle.fd;
+        let policy = policy.get();
+        read_ahead.fill(|out| recv_with(fd, out, policy))
     }
 
     fn consume(&mut self, amt: usize) {
@@ -311,7 +492,7 @@ impl BufRead for TcpStream {
 
 impl Write for TcpStream {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        send_blocking(self.fd, buf)
+        send_with(self.handle.fd, buf, self.policy.get())
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -388,6 +569,24 @@ impl TcpListener {
     /// The underlying socket descriptor.
     pub const fn fd(&self) -> i32 {
         self.fd
+    }
+
+    /// Issue `setsockopt(SO_REUSEADDR)` on the listening socket.
+    ///
+    /// A real ABI call with a real answer, and an honest one: this kernel
+    /// validates `SO_REUSEADDR` and ignores it (ports are reserved at `bind`,
+    /// and there is no `TIME_WAIT` reuse policy), so `Ok(())` means "the ABI
+    /// accepted the option", not "the port is now reusable". The live
+    /// transcript shows both halves — the accepted option and the second bind
+    /// that still fails. A kernel without the option is
+    /// [`ErrorKind::Unsupported`].
+    pub fn set_reuseaddr(&self, reuse: bool) -> Result<()> {
+        set_reuseaddr(self.fd, reuse)
+    }
+
+    /// What the kernel reports for `getsockopt(SO_TYPE)`.
+    pub fn socket_type(&self) -> Result<SocketType> {
+        socket_type_of(self.fd)
     }
 
     /// The address this listener was bound to.
@@ -503,6 +702,7 @@ pub struct UdpSocket {
     fd: i32,
     open: bool,
     nonblocking: AtomicBool,
+    read_timeout: Cell<Option<Duration>>,
     local: Option<SocketAddr>,
 }
 
@@ -527,6 +727,7 @@ impl UdpSocket {
             fd,
             open: true,
             nonblocking: AtomicBool::new(false),
+            read_timeout: Cell::new(None),
             local: if port == 0 {
                 None
             } else {
@@ -591,6 +792,9 @@ impl UdpSocket {
         if self.is_nonblocking() {
             return self.try_recv_from(buf);
         }
+        if let Some(timeout) = self.read_timeout() {
+            return self.recv_until(buf, timeout);
+        }
         loop {
             match sys::recvfrom(self.fd, buf, 0) {
                 Ok((read, source)) => return Ok((read, socket_addr_of(&source))),
@@ -600,6 +804,62 @@ impl UdpSocket {
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+
+    /// A receive bounded by the SDK deadline.
+    ///
+    /// It cannot use the ABI's blocking `recvfrom`: that call waits roughly ten
+    /// seconds per attempt and cannot be cut short, which is useless as a retry
+    /// budget. `poll` on the descriptor first, then one `MSG_DONTWAIT` take.
+    fn recv_until(&mut self, buf: &mut [u8], timeout: Duration) -> Result<(usize, SocketAddr)> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.try_recv_from(buf) {
+                Ok(result) => return Ok(result),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Error::new(
+                    ErrorKind::WouldBlock,
+                    "UdpSocket::recv_from timed out",
+                ));
+            }
+            let wait = deadline.saturating_duration_since(now).as_millis();
+            let wait = wait.min(i32::MAX as u128).max(1) as i32;
+            let mut fds = [PollFd {
+                fd: self.fd,
+                events: sys::POLLIN,
+                revents: 0,
+            }];
+            sys::poll(&mut fds, wait)?;
+        }
+    }
+
+    /// Bound [`recv_from`](UdpSocket::recv_from) with a deadline, or clear it.
+    ///
+    /// Exactly like the stream version: `setsockopt(SO_RCVTIMEO)` is issued to
+    /// the ABI (whose answer is returned — the kernel here validates and ignores
+    /// the value), and the deadline itself is enforced by [`recv_until`], which
+    /// is the part with observable behaviour. A timeout is
+    /// [`ErrorKind::WouldBlock`].
+    ///
+    /// [`recv_until`]: UdpSocket::recv_until
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+        set_socket_timeout(self.fd, SO_RCVTIMEO, timeout)?;
+        self.read_timeout.set(timeout);
+        Ok(())
+    }
+
+    /// The receive deadline the SDK will enforce, if any.
+    pub fn read_timeout(&self) -> Option<Duration> {
+        self.read_timeout.get()
+    }
+
+    /// What the kernel reports for `getsockopt(SO_TYPE)` (`Datagram` here).
+    pub fn socket_type(&self) -> Result<SocketType> {
+        socket_type_of(self.fd)
     }
 
     /// A single-poll receive, regardless of the socket's mode:
@@ -634,11 +894,30 @@ impl core::fmt::Debug for UdpSocket {
 // ─── blocking helpers ───────────────────────────────────────────────────────
 
 /// `recv`, retrying `EAGAIN` with a yield: the std-shaped blocking read.
-fn recv_blocking(fd: i32, buf: &mut [u8]) -> Result<usize> {
+///
+/// `policy` decides what "blocking" means: in non-blocking mode the first
+/// `EAGAIN` is the answer, with a deadline the retry loop stops at the deadline,
+/// and otherwise it yields and retries.
+fn recv_with(fd: i32, buf: &mut [u8], policy: StreamPolicy) -> Result<usize> {
+    let deadline = policy.read_timeout.map(|limit| Instant::now() + limit);
     loop {
         match sys::recv(fd, buf) {
             Ok(read) => return Ok(read),
             Err(error) if would_block(error) => {
+                if policy.nonblocking {
+                    return Err(Error::new(
+                        ErrorKind::WouldBlock,
+                        "TcpStream is in non-blocking mode",
+                    ));
+                }
+                if let Some(deadline) = deadline {
+                    if Instant::now() >= deadline {
+                        return Err(Error::new(
+                            ErrorKind::WouldBlock,
+                            "TcpStream::read timed out",
+                        ));
+                    }
+                }
                 let _ = sys::sched_yield();
             }
             Err(error) => return Err(error.into()),
@@ -646,15 +925,225 @@ fn recv_blocking(fd: i32, buf: &mut [u8]) -> Result<usize> {
     }
 }
 
-/// `send`, retrying `EAGAIN` with a yield.
-fn send_blocking(fd: i32, buf: &[u8]) -> Result<usize> {
+/// `send`, retrying `EAGAIN` with a yield under the same policy as
+/// [`recv_with`].
+fn send_with(fd: i32, buf: &[u8], policy: StreamPolicy) -> Result<usize> {
+    let deadline = policy.write_timeout.map(|limit| Instant::now() + limit);
     loop {
         match sys::send(fd, buf) {
             Ok(written) => return Ok(written),
             Err(error) if would_block(error) => {
+                if policy.nonblocking {
+                    return Err(Error::new(
+                        ErrorKind::WouldBlock,
+                        "TcpStream is in non-blocking mode",
+                    ));
+                }
+                if let Some(deadline) = deadline {
+                    if Instant::now() >= deadline {
+                        return Err(Error::new(
+                            ErrorKind::WouldBlock,
+                            "TcpStream::write timed out",
+                        ));
+                    }
+                }
                 let _ = sys::sched_yield();
             }
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+// ─── socket options ─────────────────────────────────────────────────────────
+//
+// `libpagh` freezes the syscall numbers (`sys::SYS_SETSOCKOPT` = 208,
+// `sys::SYS_GETSOCKOPT` = 209) but does not wrap them, so the SDK issues those
+// two directly. The convention is `pagh-api/docs/abi.md` §2: number in `a7`,
+// arguments in `a0..a5`, a negative return is `-errno`.
+
+/// `SOL_SOCKET` option level.
+const SOL_SOCKET: usize = 1;
+/// `SO_REUSEADDR`.
+const SO_REUSEADDR: usize = 2;
+/// `SO_TYPE` (read-only).
+const SO_TYPE: usize = 3;
+/// `SO_RCVTIMEO`.
+const SO_RCVTIMEO: usize = 20;
+/// `SO_SNDTIMEO`.
+const SO_SNDTIMEO: usize = 21;
+
+/// One ABI syscall, six arguments.
+///
+/// SAFETY: the kernel validates every user pointer and never trusts the values
+/// passed here; the block declares the syscall-clobbered registers and a memory
+/// clobber, so the compiler cannot cache user memory across the call. This is
+/// the same contract `libpagh::sys` implements — see that crate's `syscall6`.
+#[inline]
+unsafe fn raw_syscall6(
+    nr: usize,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+) -> isize {
+    let ret: isize;
+    // SAFETY: `ecall` with `a7` = syscall number and `a0..a5` = arguments, per
+    // the frozen RISC-V ABI; the memory clobber keeps user memory coherent.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") a0 => ret,
+            in("a1") a1,
+            in("a2") a2,
+            in("a3") a3,
+            in("a4") a4,
+            in("a5") a5,
+            in("a7") nr,
+        );
+    }
+    ret
+}
+
+/// Turn a raw syscall return into the SDK's error.
+fn check_raw(ret: isize) -> Result<usize> {
+    if ret < 0 {
+        Err(Errno::from_raw((-ret) as i32).into())
+    } else {
+        Ok(ret as usize)
+    }
+}
+
+/// `setsockopt(fd, SOL_SOCKET, name, value, len)`.
+///
+/// The option buffer must be non-null even when it is ignored: the kernel
+/// validates the pointer and answers `EFAULT` for a null one.
+fn setsockopt(fd: i32, name: usize, value: &[u8]) -> Result<()> {
+    // SAFETY: `value` is a live slice for the duration of the call.
+    let ret = unsafe {
+        raw_syscall6(
+            sys::SYS_SETSOCKOPT,
+            fd as usize,
+            SOL_SOCKET,
+            name,
+            value.as_ptr() as usize,
+            value.len(),
+            0,
+        )
+    };
+    let _ = check_raw(ret)?;
+    Ok(())
+}
+
+/// `getsockopt(fd, SOL_SOCKET, name, value, *len)` for a four-byte answer.
+///
+/// The kernel reads the caller's capacity from `*len` first and writes back how
+/// many bytes it produced, so the length really is in/out and lives in a local
+/// the kernel can update.
+fn getsockopt_u32(fd: i32, name: usize) -> Result<u32> {
+    let mut value = [0u8; 4];
+    let mut length: u32 = 4;
+    // SAFETY: `value` and `length` are live locals the kernel writes through;
+    // it validates both ranges before touching them.
+    let ret = unsafe {
+        raw_syscall6(
+            sys::SYS_GETSOCKOPT,
+            fd as usize,
+            SOL_SOCKET,
+            name,
+            value.as_mut_ptr() as usize,
+            &mut length as *mut u32 as usize,
+            0,
+        )
+    };
+    let _ = check_raw(ret)?;
+    Ok(u32::from_le_bytes(value))
+}
+
+/// What the kernel says a descriptor is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketType {
+    /// `SOCK_STREAM`.
+    Stream,
+    /// `SOCK_DGRAM`.
+    Datagram,
+}
+
+/// `getsockopt(SOL_SOCKET, SO_TYPE)` on one descriptor.
+fn socket_type_of(fd: i32) -> Result<SocketType> {
+    match getsockopt_u32(fd, SO_TYPE)? {
+        1 => Ok(SocketType::Stream),
+        2 => Ok(SocketType::Datagram),
+        _other => Err(Error::new(
+            ErrorKind::InvalidData,
+            "getsockopt(SO_TYPE) returned a type this SDK does not know",
+        )),
+    }
+}
+
+/// The four-byte `int` a BSD `SO_REUSEADDR` takes.
+fn set_reuseaddr(fd: i32, reuse: bool) -> Result<()> {
+    let value = (reuse as i32).to_le_bytes();
+    match setsockopt(fd, SO_REUSEADDR, &value) {
+        Ok(()) => Ok(()),
+        // "Accepted no-op" and "not implemented" must stay distinguishable: the
+        // kernel answers ENOPROTOOPT for an option it does not know, and that is
+        // the one answer the SDK reports as typed Unsupported.
+        Err(error) if error.raw_os_error() == Some(92) => Err(Error::unsupported(
+            "setsockopt(SO_REUSEADDR): this kernel has no such option",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+/// The 16-byte `struct timespec` a BSD timeout option takes.
+fn set_socket_timeout(fd: i32, name: usize, timeout: Option<Duration>) -> Result<()> {
+    let timeout = timeout.unwrap_or(Duration::ZERO);
+    let mut value = [0u8; 16];
+    value[..8].copy_from_slice(&(timeout.as_secs() as i64).to_le_bytes());
+    value[8..].copy_from_slice(&(timeout.subsec_nanos() as i64).to_le_bytes());
+    setsockopt(fd, name, &value)
+}
+
+// ─── host:port ──────────────────────────────────────────────────────────────
+
+/// Connect to `host:port`, resolving `host` through [`dns`] first.
+///
+/// This is the `(host:port)` shape `std::net::TcpStream::connect` accepts: a
+/// dotted-quad literal is used as-is, a name goes through the SDK's RFC 1035
+/// resolver. The port is mandatory; there is no default-port table.
+///
+/// ```ignore
+/// let stream = pagh_std::net::connect("example.com:443")?;
+/// ```
+pub fn connect(host_port: &str) -> Result<TcpStream> {
+    let (host, port) = split_host_port(host_port)?;
+    TcpStream::connect_host(host, port)
+}
+
+/// Split `host:port` into its two halves, rejecting everything malformed.
+fn split_host_port(text: &str) -> Result<(&str, u16)> {
+    let (host, port) = text.rsplit_once(':').ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "expected host:port (the ABI has no default-port table)",
+        )
+    })?;
+    if host.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "host must not be empty",
+        ));
+    }
+    let port: u16 = port
+        .parse()
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "port must be 1..=65535"))?;
+    if port == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "port must be 1..=65535",
+        ));
+    }
+    Ok((host, port))
 }
