@@ -64,6 +64,28 @@ def sha256(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def kernel_package_version(kernel: pathlib.Path) -> str:
+    """Read the kernel crate's version for the transcript header.
+
+    The header used to carry a literal version, so every transcript produced
+    after a kernel bump mislabelled the tree that actually ran. Walk up from the
+    kernel ELF (``target/<target>/<profile>/pagh``) to the checkout's Cargo.toml
+    and record what it says, like ``tools/live_net.py`` does.
+    """
+    for parent in kernel.parents:
+        manifest = parent / "Cargo.toml"
+        if not manifest.is_file():
+            continue
+        try:
+            text = manifest.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+        if match:
+            return match.group(1)
+    return "unknown"
+
+
 def toolchain_channel() -> str:
     text = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
     match = re.search(r'^channel\s*=\s*"([^"]+)"', text, re.MULTILINE)
@@ -613,7 +635,7 @@ repo state:        {(subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--sho
 toolchain:         {channel} ({rustc_version(channel)})
 target:            {TARGET}
 kernel:            {kernel} (sha256 {sha256(kernel)})
-kernel package:    pagh-riscv 0.11.0 (Cargo.toml)
+kernel package:    pagh-riscv {kernel_package_version(kernel)} (read from the checkout)
 qemu:              {qemu_version()}
 image:             64 MiB ext2, mke2fs -q -t ext2 -F -b 4096 -d <rootfs> disk.img 64M
 build:             ./build.sh --fixtures (debug profile, opt-level 2, strip debuginfo)
