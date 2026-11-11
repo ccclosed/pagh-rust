@@ -774,9 +774,10 @@ impl UdpSocket {
     /// Create a UDP socket and bind `address:port`.
     ///
     /// `address` must be `0.0.0.0` or the interface's DHCP lease; anything else
-    /// is `EADDRNOTAVAIL`. A port owned by another socket is `EADDRINUSE` (the
-    /// kernel's answer; `libpagh`'s frozen errno table has no `EADDRINUSE`
-    /// entry, so it arrives as the SDK's `Uncategorized` kind).
+    /// is `EADDRNOTAVAIL`. A port owned by another socket is `EADDRINUSE`. Both
+    /// are the kernel's answer: with libpagh 0.6.0's frozen table they arrive as
+    /// the SDK's `Uncategorized` kind, while a 0.6.1 sibling maps them to
+    /// [`ErrorKind::AddrNotAvailable`] and [`ErrorKind::AddrInUse`].
     pub fn bind_to(address: Ipv4, port: u16) -> Result<UdpSocket> {
         let fd = sys::socket(sys::AF_INET, sys::SOCK_DGRAM, 0)?;
         let socket = UdpSocket {
@@ -830,8 +831,9 @@ impl UdpSocket {
     ///
     /// Returns the payload length on success. A payload above the kernel's
     /// 1024-byte limit fails before anything is sent (the kernel answers
-    /// `EMSGSIZE`; `libpagh`'s frozen errno table has no entry for it, so the
-    /// error arrives as the SDK's `Uncategorized` kind).
+    /// `EMSGSIZE`; libpagh 0.6.0's frozen table omits it and the error arrives
+    /// as `Uncategorized`, while a 0.6.1 sibling maps it to
+    /// [`ErrorKind::InvalidInput`]).
     pub fn send_to(&self, buf: &[u8], address: SocketAddr) -> Result<usize> {
         let sent = sys::sendto(self.fd, buf, &sockaddr_in_of(address))?;
         Ok(sent)

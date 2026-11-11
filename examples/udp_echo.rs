@@ -15,8 +15,10 @@
 //! 4. `try_recv_from` in a deadline loop for the second, larger datagram, which
 //!    also exercises `time::sleep_until`;
 //! 5. a payload above the kernel's 1024-byte ceiling, which must fail before
-//!    anything is sent (`EMSGSIZE`; `libpagh` has no entry for that errno, so
-//!    the SDK reports `Uncategorized`/`Unknown error` — printed, not hidden).
+//!    anything is sent (`EMSGSIZE`; with libpagh 0.6.0 the SDK reports
+//!    `Uncategorized`/`Unknown error` because that frozen table omits the
+//!    errno, while a 0.6.1 sibling maps it to `InvalidInput` — printed, not
+//!    hidden, either way).
 //!
 //! Run it in the guest against a host UDP echo server:
 //!

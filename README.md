@@ -90,7 +90,7 @@ pagh_std/src/
   io.rs                    Read/Write/Seek/BufRead, buffers, console handles
   fs.rs                    File/OpenOptions/ReadDir/Metadata + fs operations
   env.rs                   args/vars/PWD tracking/temp_dir
-  path.rs                  UTF-8 Path/PathBuf/Components + lexical normalize
+  path.rs                  UTF-8 Path/PathBuf/Components, prefix matching, lexical normalize
   time.rs                  Duration, Instant, SystemTime, sleep/sleep_until
   process.rs               exit/abort/fork/execve/wait/Command
   collections/             alloc containers + the real HashMap/HashSet
@@ -223,7 +223,13 @@ cargo build --examples -p pagh_std
 ```
 
 `build.sh` passes `-C link-arg=-T<pagh-api>/pagh-user.ld -C linker=rust-lld`
-(mirroring `pagh-api/.cargo/config.toml`) and the pinned toolchain/target.
+(mirroring `pagh-api/.cargo/config.toml`) and the pinned toolchain/target. It
+does **not** pass `--locked`: the only non-vendored dependency is the sibling
+`pagh-api`, so the `libpagh` version recorded in `Cargo.lock` follows another
+repository's release cadence, and a hard lock would turn an old commit red
+whenever that library bumps. The vendored crates stay exact-pinned in
+`pagh_std/Cargo.toml` and are resolved from `vendor/`, so the lock is still the
+source of truth for everything the SDK links.
 The linker script places the image at `0x1_0000`, `_start` in `.text.entry`,
 and produces R+X/R/R+W `PT_LOAD` segments; there is no TLS, `.init_array` or
 dynamic section.
@@ -234,7 +240,7 @@ The pure path logic can be compiled for the host; `libpagh` itself cannot
 (RISC-V `ecall` assembly). `hostcheck` includes the pure sources directly —
 `path.rs`, `hash.rs`, `collections/{hash_map,hash_set}.rs`, `lazy.rs`,
 `net/dns_wire.rs`, `tls/{url,http}.rs` and the vendored `tls/vendored/hostname.rs`
-— 37 checks:
+— 40 checks:
 
 ```sh
 cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu
@@ -483,14 +489,18 @@ elapsed time as a `u64` for log lines. Both inherit the kernel's 10 ms tick:
 UTF-8 `Path` (unsized, `#[repr(transparent)]` over `str`) and `PathBuf`
 (`String`): `new`, `as_str`, `to_path_buf`, `join`, `parent`, `file_name`,
 `file_stem`, `extension`, `with_extension`, `with_file_name`, `display`,
-`components`, `is_absolute`/`is_relative`, `to_str`, `to_string_lossy`,
+`components`, `starts_with`, `strip_prefix`, `ancestors`,
+`is_absolute`/`is_relative`, `to_str`, `to_string_lossy`,
 `push`/`pop`/`set_file_name`/`set_extension`, `normalize`, `normalize_join`,
 and `Display`/`Debug`.
 
 `components()` yields `RootDir`, `CurDir`, `ParentDir`, `Normal(&str)`;
 `join` follows std (absolute replaces, no normalization), while `fs` normalizes
-lexically before every syscall. No `OsStr`, no `strip_prefix`, no
-`starts_with` component matching yet.
+lexically before every syscall. `starts_with`/`strip_prefix` compare whole
+components (never byte prefixes), treat `.` and `..` lexically like the rest of
+the module, and `strip_prefix` returns the remainder borrowed from the path;
+`ancestors` walks the `parent()` chain down to the empty path. There is no
+`OsStr` and no Windows prefix.
 
 ### `pagh_std::collections` and `pagh_std::hash`
 
@@ -770,13 +780,17 @@ Impossible without new kernel syscalls (shown with the SDK's typed
   with a four-entry accept queue, eight TCP connections and eight bound UDP
   ports; no `getsockname`/`getpeername` (`local_addr`/`peer_addr` are the SDK's
   record of the call), no half-close, and no way to learn an ephemeral port.
-  `libpagh`'s frozen errno table has no `EADDRINUSE`, `EADDRNOTAVAIL` or
-  `EMSGSIZE`, so a bind conflict, a non-local bind address and an oversized
-  datagram arrive as `ErrorKind::Uncategorized` with the message
-  `Unknown error (outside the pagh ABI)` — the kernel did report the specific
-  errno, and the SDK cannot see it. `SO_REUSEADDR` is accepted by the kernel and
-  has no effect (ports are reserved at `bind`); the SDK's timeouts are enforced
-  by the SDK. `try_clone` shares one descriptor because the ABI refuses `dup`
+  `libpagh` 0.6.0's frozen errno table has no `EADDRINUSE`, `EADDRNOTAVAIL`,
+  `EMSGSIZE`, `EINTR`, `E2BIG`, `ESRCH`, `ENOEXEC`, `ECHILD` or
+  `EDESTADDRREQ`, so with that sibling a bind conflict, a non-local bind
+  address and an oversized datagram arrive as `ErrorKind::Uncategorized` with
+  the message `Unknown error (outside the pagh ABI)`. `pagh_std` maps the
+  numbers libpagh 0.6.1 records by raw value, so once the sibling is 0.6.1 the
+  same build reports `AddrInUse` / `AddrNotAvailable` / `InvalidInput` (and the
+  ABI's own message text) without a source change here; `EINTR` and `E2BIG` get
+  `Interrupted` and `ArgumentListTooLong`. `SO_REUSEADDR` is accepted by the
+  kernel and has no effect (ports are reserved at `bind`); the SDK's timeouts
+  are enforced by the SDK. `try_clone` shares one descriptor because the ABI refuses `dup`
   on a socket. IPv6 does not exist here;
 - **DNS**: `pagh_std::net::dns` is a stub resolver, not a system resolver: it
   has no IPv6/`AAAA`, no `MX`/`TXT`/`SRV`, no TCP fallback for a truncated
@@ -827,11 +841,10 @@ Impossible without new kernel syscalls (shown with the SDK's typed
   not an on-device toolchain.
 
 Also deliberately not provided in this first version: `io::Cursor`,
-`Read::chain`, `Tee`, file locking, `is_terminal`, `Path::starts_with` /
-`strip_prefix` / `ancestors`, `OsString`, `Rc`/`Arc` re-exports, `OnceLock`,
-`Path::starts_with`/`strip_prefix`/`ancestors`, and raw-entry/nightly hash-map
-APIs. They are userland-only conveniences the SDK can grow without a kernel
-change; the current surface is the part exercised by the live transcript.
+`Read::chain`, `Tee`, file locking, `is_terminal`, `OsString`, `Rc`/`Arc`
+re-exports, `OnceLock`, and raw-entry/nightly hash-map APIs. They are
+userland-only conveniences the SDK can grow without a kernel change; the
+current surface is the part exercised by the live transcript.
 
 ## Design notes
 
@@ -896,7 +909,7 @@ included). `python3 tools/live_070.py` reproduces the 0.7.0 matrix in one boot
 and rewrites `docs/live-sdk-0.7.0.txt` (**55/55 checks**, kernel and ELF
 hashes included). `python3 tools/live_080.py` reproduces the 0.8.0
 kernel-backed TLS matrix and rewrites `docs/live-sdk-0.8.0.txt` (**32/32
-checks**); the host unit tests are 37 checks
+checks**); the host unit tests are 40 checks
 (`cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`).
 
 ## CI
@@ -912,8 +925,15 @@ checks**); the host unit tests are 37 checks
    `udp_echo`, `sync_primitives` and the kernel-backed `tls_get` — is ≤ 1 MiB;
 6. builds `--release --vendored` and checks `tls_get_vendored` (plus the release
    sizes of the 0.7.0 examples) against the same limit;
-7. runs `cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu --locked`;
+7. runs `cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`;
 8. uploads the example ELFs.
+
+Neither cargo invocation passes `--locked` (steps 4 and 7): the workspace
+lockfile records the sibling `libpagh` version, which follows `pagh-api`'s
+release cadence, so a hard lock would make this repository's CI red because
+another repository bumped a library. The vendored TLS crates are exact-pinned
+in `pagh_std/Cargo.toml` and resolved from `vendor/`, so the lock still fixes
+everything the SDK actually links.
 
 The live QEMU check is intentionally not in CI: it needs the kernel checkout
 and QEMU, and the transcript is the acceptance artifact for this milestone.
