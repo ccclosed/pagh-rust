@@ -98,10 +98,16 @@ FEATURES=()
 if [ "$BUILD_VENDORED" -eq 1 ]; then
     FEATURES=(--features vendored-tls)
 fi
-cargo "+$TOOLCHAIN" build --locked --target "$TARGET" --profile "$PROFILE" --examples \
+# No `--locked` on purpose: the only non-vendored dependency is the sibling
+# `pagh-api` checkout, so the `libpagh` version recorded in Cargo.lock follows
+# another repository's release cadence. Locking it would turn an old commit red
+# whenever `pagh-api` bumps the library. The vendored crates are exact-pinned in
+# pagh_std/Cargo.toml and come from `vendor/`, so the lock is still used for
+# everything the SDK actually links.
+cargo "+$TOOLCHAIN" build --target "$TARGET" --profile "$PROFILE" --examples \
     -p pagh_std "${FEATURES[@]}"
 if [ "$BUILD_FIXTURES" -eq 1 ]; then
-    cargo "+$TOOLCHAIN" build --locked --target "$TARGET" --profile "$PROFILE" --examples \
+    cargo "+$TOOLCHAIN" build --target "$TARGET" --profile "$PROFILE" --examples \
         -p pagh_probes
 fi
 

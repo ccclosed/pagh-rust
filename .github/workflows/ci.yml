@@ -11,6 +11,12 @@ name: ci
 # pagh-rust and pagh-api are checked out as siblings because the Cargo
 # dependency and the linker script live in pagh-api. The toolchain is read from
 # rust-toolchain.toml, so bumping the pin is one line.
+#
+# Neither cargo invocation passes `--locked`: `Cargo.lock` records the sibling
+# `libpagh` version, which follows pagh-api's release cadence, so a hard lock
+# would turn this repository red because another repository bumped a library.
+# The vendored TLS crates are exact-pinned in pagh_std/Cargo.toml and resolved
+# from `vendor/`, so the lock still fixes everything the SDK actually links.
 
 on:
   push:
@@ -97,7 +103,10 @@ jobs:
 
       - name: Host tests for the pure path logic
         working-directory: pagh-rust
-        run: cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu --locked
+        # The host crate itself has no third-party dependencies, but the
+        # workspace lockfile still names the sibling `libpagh`, so --locked
+        # would fail for the same reason the build step does not use it.
+        run: cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu
 
       - name: Upload example ELFs
         uses: actions/upload-artifact@v4
