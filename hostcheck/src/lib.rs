@@ -112,6 +112,25 @@ mod tests {
         assert_eq!(Path::new("/a/b/").file_name(), Some("b"));
         assert_eq!(Path::new("/a/..").file_name(), None);
         assert_eq!(Path::new("/").file_name(), None);
+        // A trailing `.` component is not a component (std's next_back): the
+        // path before it is both the file name and the parent's tail.
+        assert_eq!(Path::new("a/.").file_name(), Some("a"));
+        assert_eq!(Path::new("a/./").file_name(), Some("a"));
+        assert_eq!(Path::new("a/.").parent().unwrap().as_str(), "");
+        assert_eq!(Path::new("a/./b").parent().unwrap().as_str(), "a");
+        assert_eq!(Path::new("/a/./b").parent().unwrap().as_str(), "/a");
+        assert_eq!(Path::new("///a").parent().unwrap().as_str(), "/");
+        assert_eq!(Path::new("//").parent(), None);
+        // Repeated separators and trailing dots do not survive into the parent.
+        assert_eq!(Path::new("a//b//").parent().unwrap().as_str(), "a");
+        assert_eq!(Path::new("../.").parent().unwrap().as_str(), "");
+        assert_eq!(Path::new("/a/..").parent().unwrap().as_str(), "/a");
+        // The extension family is built on `file_name`, so the same path now
+        // names the file before the trailing dot.
+        assert_eq!(Path::new("a.b/.").extension(), Some("b"));
+        assert_eq!(Path::new("a.b/./").file_stem(), Some("a"));
+        assert_eq!(Path::new("...").extension(), Some(""));
+        assert_eq!(Path::new("...").file_stem(), Some(".."));
     }
 
     #[test]
@@ -145,11 +164,17 @@ mod tests {
 
     #[test]
     fn strip_prefix_returns_a_borrowed_remainder() {
-        // The empty prefix consumes nothing, so the whole (possibly absolute)
-        // path is returned unchanged.
+        // The empty prefix consumes nothing: the whole path (possibly
+        // absolute) is the remainder, with trailing separators trimmed the way
+        // std's `Components::as_path` trims them.
         assert_eq!(Path::new("").strip_prefix(""), Ok(Path::new("")));
         assert_eq!(Path::new("a").strip_prefix(""), Ok(Path::new("a")));
         assert_eq!(Path::new("/a/b").strip_prefix(""), Ok(Path::new("/a/b")));
+        assert_eq!(Path::new("a/b//").strip_prefix(""), Ok(Path::new("a/b")));
+        assert_eq!(Path::new("../").strip_prefix(""), Ok(Path::new("..")));
+        assert_eq!(Path::new("..//.").strip_prefix(""), Ok(Path::new("..")));
+        assert_eq!(Path::new("//a//").strip_prefix(""), Ok(Path::new("//a")));
+        assert_eq!(Path::new("///").strip_prefix(""), Ok(Path::new("/")));
         // The remainder is spelled as in `self` with leading separators gone.
         assert_eq!(Path::new("a/b").strip_prefix("a"), Ok(Path::new("b")));
         assert_eq!(Path::new("a/b").strip_prefix("a/"), Ok(Path::new("b")));
@@ -158,6 +183,22 @@ mod tests {
         assert_eq!(Path::new("a//b").strip_prefix("a"), Ok(Path::new("b")));
         assert_eq!(Path::new("a/./b").strip_prefix("a"), Ok(Path::new("b")));
         assert_eq!(Path::new("a/./b").strip_prefix("a/."), Ok(Path::new("b")));
+        // Interior spelling of the *remainder* is kept; only its edges are
+        // normalized (`a//b//c` keeps the `//` between `b` and `c`).
+        assert_eq!(
+            Path::new("a//b//c").strip_prefix("a"),
+            Ok(Path::new("b//c"))
+        );
+        assert_eq!(
+            Path::new("a/./b/./c").strip_prefix("a"),
+            Ok(Path::new("b/./c"))
+        );
+        // Trailing separators and trailing `.` components are trimmed, like
+        // std's `Components::as_path`.
+        assert_eq!(Path::new("a/b/./").strip_prefix("a/b"), Ok(Path::new("")));
+        assert_eq!(Path::new("a/b/.").strip_prefix("a"), Ok(Path::new("b")));
+        assert_eq!(Path::new("/a//b//").strip_prefix("/a"), Ok(Path::new("b")));
+        assert_eq!(Path::new("../../").strip_prefix(".."), Ok(Path::new("..")));
         assert_eq!(Path::new("./a").strip_prefix("."), Ok(Path::new("a")));
         assert_eq!(Path::new("a/.").strip_prefix("a"), Ok(Path::new("")));
         assert_eq!(Path::new("/a/b").strip_prefix("/"), Ok(Path::new("a/b")));

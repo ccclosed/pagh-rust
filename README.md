@@ -494,11 +494,14 @@ UTF-8 `Path` (unsized, `#[repr(transparent)]` over `str`) and `PathBuf`
 `push`/`pop`/`set_file_name`/`set_extension`, `normalize`, `normalize_join`,
 and `Display`/`Debug`.
 
-`components()` yields `RootDir`, `CurDir`, `ParentDir`, `Normal(&str)`;
-`join` follows std (absolute replaces, no normalization), while `fs` normalizes
-lexically before every syscall. `starts_with`/`strip_prefix` compare whole
-components (never byte prefixes), treat `.` and `..` lexically like the rest of
-the module, and `strip_prefix` returns the remainder borrowed from the path;
+`components()` yields `RootDir`, `CurDir`, `ParentDir`, `Normal(&str)` and
+keeps a `CurDir` for an empty path and for every interior `.`: it is the
+textual view the normalization helpers read (std skips those). The query
+methods are std-exact: `starts_with`/`strip_prefix` compare whole components
+(never byte prefixes), `strip_prefix` returns the remainder borrowed from the
+path with its edges trimmed the way `Components::as_path` trims them, and
+`parent`, `file_name`, `file_stem` and `extension` skip trailing separators and
+trailing `.` components (`a/./` names `a`, `/a/./b` has parent `/a`).
 `ancestors` walks the `parent()` chain down to the empty path. There is no
 `OsStr` and no Windows prefix.
 
