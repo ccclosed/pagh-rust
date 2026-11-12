@@ -42,15 +42,32 @@ What *is* fully real is **Rust the language** plus the `alloc` crate:
   `rc::Rc`/`Weak` at the `std` paths, and a `LazyLock` that stays
   single-threaded (a documented deviation) but gains `Default`. The atomic
   state machine behind `OnceLock` is plain `core`, so the host gate races it
-  with real threads; only the parking half is target-only.
+  with real threads; only the parking half is target-only;
+- **in-memory writers and readers** (0.11.0): the `io::Write` impls std gives
+  to `Vec<u8>`, `&mut [u8]` and the writer cursors (`Cursor<Vec<u8>>`,
+  `Cursor<&mut Vec<u8>>`, `Cursor<&mut [u8]>`, `Cursor<[u8; N]>`,
+  `Cursor<Box<[u8]>>`), plus `BufRead for &[u8]`. A program can build or
+  consume a byte buffer with no file and no syscall; the short-write and
+  `WriteZero` semantics are pinned by the host gate and re-proved in the guest.
 
 `pagh_std` does **not** claim to be `std`, does not provide dynamic linking or
 `OsStr`, and returns a typed `io::ErrorKind::Unsupported` for operations the
 ABI cannot express. Those are listed under
 [Limitations vs std](#limitations-vs-std).
 
-**Live evidence:** [`docs/live-sdk-0.10.0.txt`](docs/live-sdk-0.10.0.txt) is the
-QEMU serial transcript for 0.10.0 — one boot against `pagh-riscv 0.21.2` that
+**Live evidence:** [`docs/live-sdk-0.11.0.txt`](docs/live-sdk-0.11.0.txt) is the
+QEMU serial transcript for 0.11.0 — one boot against `pagh-riscv 0.21.2` that
+runs the `io_writers` matrix, **13/13 checks passed**: `Vec<u8>` accepts
+`write!`/`writeln!` through `write_fmt`; `&mut [u8]` short-writes and reports
+`WriteZero`; a `Cursor<Vec<u8>>` overwrites in place, zero-pads a seek past the
+end and reads the result back; the bounded writer cursors stop at the slice
+end; `BufRead for &[u8]` runs `fill_buf`/`consume`/`read_until`/`lines` over a
+borrowed buffer; `fmt::Write` and the `str`/`String` helpers are shown on the
+target; and `copy`, `Tee` over two `Vec`s and `BufWriter<Vec<u8>>` compose.
+
+The 0.10.0 transcript remains the evidence for that release:
+[`docs/live-sdk-0.10.0.txt`](docs/live-sdk-0.10.0.txt) is the
+QEMU serial transcript — one boot against `pagh-riscv 0.21.2` that
 runs the `sync_once_lock` matrix, **13/13 checks passed**: four native threads
 racing `OnceLock::get_or_init` (exactly one initializer runs), a `set` race with
 one winner and three `Err(value)`, `wait()` parking the main thread until a
@@ -153,9 +170,9 @@ pagh_std/src/
   panic.rs                 PanicInfo/abort + the runtime contract
   ffi.rs                   c_* types, CStr/CString
 examples/                  cat, wc, find, threads_mutex, spawn, condvar, io_traits,
-                           io_adapters, tcp_server, udp_echo, sync_primitives,
-                           sync_once_lock, hash_map, dns, socket_opts, tls_get,
-                           tls_get_vendored (feature-gated)
+                           io_adapters, io_writers, tcp_server, udp_echo,
+                           sync_primitives, sync_once_lock, hash_map, dns,
+                           socket_opts, tls_get, tls_get_vendored (feature-gated)
 hostcheck/                 host cargo test for the pure modules (path, hash,
                            collections, lazy, dns_wire, tls url/http/hostname,
                            io core + error, OnceLock state machine, Rc/Arc)
@@ -170,6 +187,8 @@ tools/live_090.py          the 0.9.0 live matrix: Cursor/Chain/Tee in one
                            boot, including the Tee file read back by `cat`
 tools/live_100.py          the 0.10.0 live matrix: OnceLock races, wait(),
                            LazyLock, Rc/Arc in one boot
+tools/live_110.py          the 0.11.0 live matrix: the in-memory sinks, writer
+                           cursors and BufRead for &[u8] in one boot
 tools/live_net.py          the 0.6.0 network/sync live matrix (one boot, one
                            command at a time, host peers, docs/ transcript)
 .github/workflows/ci.yml   fmt + RISC-V build + host tests
@@ -181,6 +200,7 @@ docs/live-sdk-0.7.0.txt    the 0.7.0 captured run (55/55: hash map, DNS,
 docs/live-sdk-0.8.0.txt    the 0.8.0 captured run (32/32: kernel-backed TLS)
 docs/live-sdk-0.9.0.txt    the 0.9.0 captured run (12/12: Cursor, Chain, Tee)
 docs/live-sdk-0.10.0.txt   the 0.10.0 captured run (13/13: OnceLock, Rc/Arc)
+docs/live-sdk-0.11.0.txt   the 0.11.0 captured run (13/13: in-memory writers)
 ```
 
 ## A program
@@ -252,6 +272,7 @@ target/riscv64gc-unknown-none-elf/debug/examples/socket_opts             261 KiB
 target/riscv64gc-unknown-none-elf/debug/examples/tls_get                 284 KiB
 target/riscv64gc-unknown-none-elf/debug/examples/io_adapters             225 KiB
 target/riscv64gc-unknown-none-elf/debug/examples/sync_once_lock          210 KiB
+target/riscv64gc-unknown-none-elf/debug/examples/io_writers              230 KiB
 target/riscv64gc-unknown-none-elf/release/examples/tls_get_vendored      760 KiB
 ```
 
@@ -289,7 +310,8 @@ The pure logic can be compiled for the host; `libpagh` itself cannot
 `net/dns_wire.rs`, `tls/{url,http}.rs`, the vendored `tls/vendored/hostname.rs`
 and, since 0.9.0, `error.rs` plus the kernel-independent half of the I/O
 module, `io/pure.rs`; 0.10.0 adds `sync/once_lock_core.rs` (the atomic state
-machine behind `OnceLock`), `rc.rs` and `sync/arc.rs` — 77 checks:
+machine behind `OnceLock`), `rc.rs` and `sync/arc.rs`; 0.11.0 adds the
+in-memory writer and reader impls of `io/pure.rs` — 91 checks:
 
 ```sh
 cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu
@@ -307,10 +329,13 @@ host crate spells out that std-shaped three-variant enum; on the target
 are syscall-free, so this gate races them with six real host threads (where
 preemption exists) and checks the CAS protocol; the futex park/unpark half lives
 in `sync.rs` on top of `libpagh`, and the live matrix covers it with the SDK's
-own threads. `Arc` is exercised across real host threads too.
+own threads. `Arc` is exercised across real host threads too. The in-memory writers are
+pure trait impls, so their exact edges are host-tested: a short write into
+`&mut [u8]`, `WriteZero` from `write_all`, zero-padding past a `Cursor<Vec<u8>>`
+end, `BufRead for &[u8]` consuming a borrowed buffer.
 
 CI runs that plus `cargo fmt -p pagh_std -p pagh_hostcheck -p pagh_probes --
---check`, `./build.sh --fixtures`, a 1 MiB size check for all sixteen debug
+--check`, `./build.sh --fixtures`, a 1 MiB size check for all seventeen debug
 examples, and `./build.sh --release --vendored` with a size check for
 `tls_get_vendored` (release-only: its debug build is over the limit). (The package-scoped
 form is deliberate: `cargo fmt --all` also formats local path dependencies, and
@@ -480,6 +505,19 @@ python3 tools/live_100.py --skip-build --keep-work
 | `run /mnt/sync_once_lock` | four native threads race `OnceLock::get_or_init` and **one** initializer runs; a `set` race produces one `Ok(())` and three `Err(value)`; `wait()` parks the main thread until a second thread sets the value; `take`/`into_inner`/`clone`/`Default`/reuse; `LazyLock` with `Default`; `Rc`/`Weak` counting; `Arc`/`Weak` across four threads with `Arc<Mutex<u32>>` and `Arc::try_unwrap` — `SYNC_ONCE_LOCK PASS` / exit 0 |
 | the same command again | the checks are deterministic, so a second PASS shows the run is repeatable rather than a one-shot timing accident |
 
+For 0.11.0 the live check is `tools/live_110.py`, one boot for the in-memory
+surface:
+
+```sh
+python3 tools/live_110.py                     # builds, boots, drives, writes docs/
+python3 tools/live_110.py --skip-build --keep-work
+```
+
+| what the boot proves | |
+|---|---|
+| `run /mnt/io_writers` | `Vec<u8>` accepts `write!`; `&mut [u8]` short-writes and returns `WriteZero`; `Cursor<Vec<u8>>` overwrites, zero-pads past the end and reads back; the bounded writer cursors stop at the slice end; `BufRead for &[u8]` reads a borrowed buffer; `fmt::Write`/`str` helpers; `copy`/`Tee`/`BufWriter<Vec>` — `IO_WRITERS PASS` / exit 0 |
+| the same command again | deterministic checks, so a repeat PASS is not a one-shot allocation accident |
+
 ## API surface
 
 ### `pagh_std::io`
@@ -487,10 +525,10 @@ python3 tools/live_100.py --skip-build --keep-work
 | Item | Notes |
 |---|---|
 | `Read` | `read`, `read_to_end`, `read_to_string`, `read_exact`, `bytes`, `take`, `chain`, `by_ref`; implemented for `File`, `TcpStream`, `Stdin`, `BufReader`, `Cursor`, `Chain`, `Take`, `&[u8]`, `&mut R` |
-| `Write` | `write`, `flush`, `write_all`, `write_fmt`, `by_ref`; `File`, `TcpStream`, `Stdout`, `Stderr`, `BufWriter`, `Tee`, `&mut W` |
+| `Write` | `write`, `flush`, `write_all`, `write_fmt`, `by_ref`; `File`, `TcpStream`, `Stdout`, `Stderr`, `BufWriter`, `Tee`, `Vec<u8>`, `&mut [u8]`, the five writer cursors, `&mut W` |
 | `Seek`, `SeekFrom` | `seek`, `stream_position`, `rewind`, `seek_relative`; regular files and `Cursor` |
-| `BufRead`, `BufReader`, `BufWriter` | `fill_buf`, `consume`, `read_until`, `read_line`, `lines`, `split`; 8 KiB default buffer, `with_capacity`, `into_inner`, `get_ref`, `get_mut`; also implemented directly on `File`, `TcpStream`, `Cursor` and `Chain` |
-| `Cursor<T: AsRef<[u8]>>` | in-memory reader: `Read`, `BufRead` and `Seek` (`Start`/`Current`/`End`), `new`, `position`/`set_position`, `get_ref`/`get_mut`, `into_inner`; seeking past the end is allowed (the next read is EOF) and a seek before byte 0 is `InvalidInput`, as in std |
+| `BufRead`, `BufReader`, `BufWriter` | `fill_buf`, `consume`, `read_until`, `read_line`, `lines`, `split`; 8 KiB default buffer, `with_capacity`, `into_inner`, `get_ref`, `get_mut`; also implemented directly on `File`, `TcpStream`, `Cursor`, `Chain` and `&[u8]` |
+| `Cursor<T: AsRef<[u8]>>` | in-memory reader: `Read`, `BufRead` and `Seek` (`Start`/`Current`/`End`), `new`, `position`/`set_position`, `get_ref`/`get_mut`, `into_inner`; seeking past the end is allowed (the next read is EOF) and a seek before byte 0 is `InvalidInput`, as in std. `Write` is implemented, as in std, for the concrete writers `Cursor<Vec<u8>>`, `Cursor<&mut Vec<u8>>`, `Cursor<&mut [u8]>`, `Cursor<[u8; N]>` and `Cursor<Box<[u8]>>` — growable cursors zero-pad a position past the end, fixed ones stop at the slice end |
 | `Chain<T, U>` | returned by `Read::chain`; reads `first` to EOF and then `second`, never touching `second` early; `BufRead` when both halves are; `get_ref`/`get_mut`/`into_inner` |
 | `Tee<W, F>` | `Write` adapter that mirrors every byte `writer` accepts into `file` with `write_all`; `new`, `get_ref`/`get_mut`, `into_inner`; `flush` flushes the writer first |
 | `stdin`, `stdout`, `stderr` | console handles; `Stdin::read` blocks by retrying `EAGAIN` with `sched_yield`; output retries `EAGAIN` too |
@@ -499,12 +537,18 @@ python3 tools/live_100.py --skip-build --keep-work
 | `Error`, `ErrorKind`, `Result` | `Error` wraps `libpagh::errno::Errno`, keeps the raw number, maps to std-shaped kinds; `Unsupported` is the typed "ABI cannot do this" |
 
 `Cursor`, `Read::chain` and `Tee` are the items 0.8.0's README listed as
-deliberately absent; they are userland-only and need no syscall. Two deviations
-from `std` are spelled out where they live: this `Cursor` has **no `Write`
-implementation** (std has one for `Cursor<&mut [u8]>`/`Cursor<Vec<u8>>`/
-`Cursor<Box<[u8]>>`; here the `T: AsRef<[u8]>` reader is the whole type), and
-`Tee` — which `std` only has on nightly behind `#![feature(io_tee)]` — is
-stable here.
+deliberately absent; they are userland-only and need no syscall. 0.11.0 closed
+the one deviation that was left in the I/O surface — the writer cursors — so
+`Cursor` now has std's full reader **and** writer shape. The one remaining I/O
+deviation is `Tee`: `std` only has it on nightly behind `#![feature(io_tee)]`,
+while here it is stable.
+
+The in-memory sinks match std's semantics: `Vec<u8>` appends every byte,
+`&mut [u8]` copies and then advances the slice (short write at the end,
+`WriteZero` from `write_all`), and a growable `Cursor` writes every byte,
+zero-padding a position past the end. `BufRead for &[u8]` hands out the
+unread part of the slice and consumes it in place, so `read_until`/`lines` over
+a borrowed buffer allocate nothing but the result.
 
 `is_terminal` remains absent, now for a checked reason rather than a policy
 one: the ABI's `fstat` reports the console as `kind = Other`, mode `0o644`,
@@ -863,7 +907,11 @@ transcript can be cross-checked against `openssl s_client` on the host
 ### `pagh_std::fmt`, `panic`, `ffi`
 
 - `fmt` re-exports `core::fmt` (`Debug`, `Display`, `Formatter`, `Arguments`,
-  `Write`, …).
+  `Write`, …). `fmt::Write` is `core::fmt::Write`, and `String` implements it
+  through `alloc`, so `write!(s, …)` works on both an `io::Write` and a
+  `fmt::Write` destination; the `str`/`String` helpers (`trim`, `to_uppercase`,
+  `replace`, `split_whitespace`, …) come from `core`/`alloc` and needed no SDK
+  code — the 0.11.0 live run exercises them on the target.
 - `panic` re-exports `PanicInfo` and offers `abort()`. It intentionally does
   **not** declare `#[panic_handler]`; see the next section.
 - `ffi` re-exports `c_void`, `c_char`, `c_int`, `c_long`, … and
@@ -1052,6 +1100,7 @@ The transcript covers:
 | DNS | 0.7.0 transcript: `/mnt/etc/resolv.conf` names the DHCP-leased server (the boot log's `dns 10.0.2.3`), a real `A` query with the server's TTLs, `NXDOMAIN`, `InvalidName` before any datagram, a 1 s deadline against a host black hole, and `connect("example.com:80")` → `HTTP/1.1 200 OK` |
 | socket options | 0.7.0 transcript: `SO_TYPE` → `Stream`/`Datagram`, `SO_REUSEADDR` accepted and the second `bind` still refused, non-blocking read `WouldBlock`, 500 ms read deadline and 300 ms UDP deadline enforced by the SDK, `try_clone` echo read back through the clone and the original still usable after it drops |
 | vendored TLS 1.3 | 0.7.0 transcript: a live `https://example.com/` GET through the userland client — chain to the committed bundle (`chain=4 anchors=6`), leaf `sha256:85ca6ab0…`, `CertificateVerify OK`, 577-byte body — and four refusals: `stage=clock`, `stage=entropy`, `cause=chain` (self-signed `openssl s_server`) and `cause=hostname` (a trusted Google chain for `example.com`) |
+| in-memory I/O | 0.11.0 transcript: `Vec<u8>` sink with `write!`; `&mut [u8]` short write + `WriteZero`; `Cursor<Vec<u8>>` overwrite/zero-pad/read-back; `Cursor<&mut [u8]>`, `Cursor<[u8; N]>`, `Cursor<Box<[u8]>>` bounded writes; `BufRead for &[u8]` (`fill_buf`/`consume`/`read_until`/`lines`); `fmt::Write` + `str`/`String` helpers; `copy`/`Tee`/`BufWriter<Vec>` composition — `IO_WRITERS PASS`, 13/13 checks |
 | synchronization additions | 0.10.0 transcript: four guest threads racing `OnceLock::get_or_init` with exactly one initializer; a `set` race (1 `Ok`, 3 `Err(value)`); `wait()` parked until set; `take`/`into_inner`/`clone`/reuse; `LazyLock` + `Default`; `Rc`/`Weak` counting; `Arc`/`Weak` across four threads (incl. `Arc<Mutex<u32>>`, `Arc::try_unwrap`) — `SYNC_ONCE_LOCK PASS`, 13/13 checks |
 | userland I/O adapters | 0.9.0 transcript: `Cursor` read/seek/position/BufRead across buffer boundaries in the guest; `Chain` over two cursors, two empty cases and a `File`+cursor pair; `Tee` mirrored 46 bytes to stdout and `/mnt/io_adapters_tee.txt`, read back by `cat` (exactly one copy after a second run) — `IO_ADAPTERS PASS`, 12/12 checks |
 | kernel-backed TLS | 0.8.0 transcript: `tls_get` fetching `https://example.com/` with **no clock and no seed argument** — `tls: verified leaf=sha256:85ca6ab0… chain=4 certs anchors=6 host=example.com`, `tls: CertificateVerify OK`, `tls: user session 0 open host=example.com (TLS 1.3, AES-128-GCM-SHA256, server authenticated, 110 ms)`, `status 200 body 577 bytes` — the same fetch through `TlsStream` (`--manual`), the vendored program seeded from `getrandom`, and two refusals: `cause=chain` and `cause=hostname`, both errno 129 |
@@ -1068,11 +1117,14 @@ kernel-backed TLS matrix and rewrites `docs/live-sdk-0.8.0.txt` (**32/32
 checks**); `python3 tools/live_090.py` reproduces the 0.9.0 I/O-adapter matrix
 and rewrites `docs/live-sdk-0.9.0.txt` (**12/12 checks**); `python3
 tools/live_100.py` reproduces the 0.10.0 synchronization matrix and rewrites
-`docs/live-sdk-0.10.0.txt` (**13/13 checks**). The host unit tests are
-**77 checks** (`cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`):
+`docs/live-sdk-0.10.0.txt` (**13/13 checks**); `python3 tools/live_110.py`
+reproduces the 0.11.0 in-memory matrix and rewrites
+`docs/live-sdk-0.11.0.txt` (**13/13 checks**). The host unit tests are
+**91 checks** (`cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`):
 the 40 from the earlier pure layers, 28 for the 0.9.0 I/O core, 7 for the
-0.10.0 sync core and reference counters, and the two `Errno` round-trip tests
-that arrive with the sibling's `errno.rs` include.
+0.10.0 sync core and reference counters, 14 for the 0.11.0 in-memory writers
+and readers, and the two `Errno` round-trip tests that arrive with the
+sibling's `errno.rs` include.
 
 ## CI
 
@@ -1084,12 +1136,13 @@ that arrive with the sibling's `errno.rs` include.
    (package-scoped because `--all` would reformat the sibling `pagh-api`);
 4. runs `./build.sh --fixtures` (all examples and probes);
 5. asserts every example a default build produces — including `tcp_server`,
-   `udp_echo`, `sync_primitives`, `io_adapters`, `sync_once_lock` and the
-   kernel-backed `tls_get` — is ≤ 1 MiB;
+   `udp_echo`, `sync_primitives`, `io_adapters`, `io_writers`,
+   `sync_once_lock` and the kernel-backed `tls_get` — is ≤ 1 MiB;
 6. builds `--release --vendored` and checks `tls_get_vendored` (plus the release
    sizes of the 0.7.0 examples) against the same limit;
 7. runs `cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`
-   (the pure I/O core and the `OnceLock` state machine are part of that gate);
+   (the pure I/O core, the `OnceLock` state machine and the in-memory writers
+   are part of that gate);
 8. uploads the example ELFs.
 
 Neither cargo invocation passes `--locked` (steps 4 and 7): the workspace
