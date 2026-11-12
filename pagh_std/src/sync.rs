@@ -1,9 +1,14 @@
-//! A single-threaded `LazyLock`, plus the `core::cell` types under std names,
-//! the kernel-0.13+ futex-backed synchronisation primitives, and a bounded
-//! [`mpsc`] channel.
+//! A single-threaded `LazyLock`, a thread-safe [`OnceLock`], plus the
+//! `core::cell` types under std names, the kernel-0.13+ futex-backed
+//! synchronisation primitives, the `alloc` reference counters ([`Arc`]/[`Weak`])
+//! and a bounded [`mpsc`] channel.
 //!
 //! [`LazyLock`] itself lives in the crate-internal `lazy` module so the host
-//! checker can include that file without `libpagh`; it is re-exported here. The [`Mutex`],
+//! checker can include that file without `libpagh`; it is re-exported here. It
+//! is single-threaded, unlike `std::sync::LazyLock`: the type is not `Sync`, so
+//! it cannot be shared between threads or placed in a `static`. Use
+//! [`OnceLock::get_or_init`] — or a `static OnceLock` — when a lazily built
+//! value has to be reachable from more than one thread. The [`Mutex`],
 //! [`RwLock`], [`Condvar`], [`Barrier`] and [`Once`] below are process-private,
 //! non-poisoning and not reentrant, matching the C library's pthread
 //! primitives.
@@ -11,6 +16,13 @@
 pub use core::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 
 pub use crate::lazy::LazyLock;
+
+/// The atomically reference-counted pointer, at the `std::sync` path.
+mod arc;
+pub use self::arc::{Arc, Weak};
+
+/// The syscall-free storage/state machine behind [`OnceLock`].
+mod once_lock_core;
 
 pub mod mpsc;
 
@@ -21,6 +33,8 @@ pub mod mpsc;
 // They are process-private (the ABI's private futex flag), non-poisoning and
 // not reentrant, matching the C library's pthread primitives.
 
+use core::fmt;
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
@@ -570,5 +584,228 @@ impl Once {
 impl Default for Once {
     fn default() -> Once {
         Once::new()
+    }
+}
+
+// ─── OnceLock ───────────────────────────────────────────────────────────────
+
+use self::once_lock_core::{Begin, Core};
+
+/// A synchronization primitive that can be written to only once, like
+/// `std::sync::OnceLock`.
+///
+/// This is the thread-safe counterpart of [`OnceCell`]: it can live in a
+/// `static`, and every thread sees the same value once one of them has
+/// published it. `OnceLock` never blocks on [`get`](OnceLock::get) — that is a
+/// lock-free `Acquire` load — and never poisons: the target is
+/// `panic = "abort"`, so a panicking initializer kills the process rather than
+/// leaving a half-initialized cell behind.
+///
+/// # Shape
+///
+/// `std`'s cell is a [`Once`] plus an `UnsafeCell<MaybeUninit<T>>`; this one is
+/// the same idea split in two: the state word and the storage are in the
+/// syscall-free `sync/once_lock_core.rs` (which the host gate races with real
+/// host threads), and the futex park/unpark used when several threads
+/// initialize at once is here.
+///
+/// # Contract
+///
+/// * Exactly one initializer wins: concurrent [`get_or_init`](OnceLock::get_or_init)
+///   calls execute **one** closure, and every caller returns a reference to
+///   that value. A concurrent [`set`](OnceLock::set) blocks until the running
+///   initializer finishes and then reports `Err(value)`, like std.
+/// * **Reentrant initialization deadlocks.** Calling `get_or_init` on the same
+///   cell from inside its own initializer blocks forever, exactly like std's
+///   current implementation.
+/// * [`wait`](OnceLock::wait) blocks until some thread initializes the cell;
+///   if no thread ever does, it waits forever (std's behaviour).
+///
+/// # Example
+///
+/// ```ignore
+/// static CONFIG: OnceLock<u32> = OnceLock::new();
+///
+/// thread::scope(|scope| {
+///     scope.spawn(|| CONFIG.get_or_init(|| 42));
+///     assert_eq!(*CONFIG.wait(), 42);
+/// });
+/// ```
+pub struct OnceLock<T> {
+    core: Core<T>,
+    /// Only used to pair the waiters with the notifier; it protects nothing.
+    gate: Mutex<()>,
+    done: Condvar,
+}
+
+// SAFETY: `&OnceLock<T>` hands out `&T` (so `T: Sync`) and lets any thread move
+// a `T` into the cell (so `T: Send`). The state word makes those moves and the
+// resulting borrows either exclusive or published, and `Core`/`Condvar` do the
+// synchronisation; the `Mutex`/`Condvar` themselves are `Send + Sync`.
+unsafe impl<T: Send + Sync> Sync for OnceLock<T> {}
+// SAFETY: sending the cell to another thread moves the (possibly initialized)
+// `T` with it, which needs `T: Send`.
+unsafe impl<T: Send> Send for OnceLock<T> {}
+
+impl<T> OnceLock<T> {
+    /// Create an uninitialized cell.
+    pub const fn new() -> OnceLock<T> {
+        OnceLock {
+            core: Core::new(),
+            gate: Mutex::new(()),
+            done: Condvar::new(),
+        }
+    }
+
+    /// The value, if a thread has published one. Never blocks.
+    pub fn get(&self) -> Option<&T> {
+        self.core.get()
+    }
+
+    /// The value mutably, if a thread has published one. Takes `&mut self`, so
+    /// no other thread can be using the cell at the same time.
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        self.core.get_mut()
+    }
+
+    /// Block until some thread has initialized the cell, and return the value.
+    ///
+    /// Waits forever if nobody ever initializes it, like `std`'s.
+    pub fn wait(&self) -> &T {
+        self.wait_ready();
+        self.core.get().expect("OnceLock::wait after publication")
+    }
+
+    /// Publish `value` if the cell is still empty.
+    ///
+    /// Returns `Ok(())` if this call stored the value, or `Err(value)` if it
+    /// did not. If another thread is initializing right now, this waits for it
+    /// to finish and then returns `Err(value)` — std's documented behaviour.
+    pub fn set(&self, value: T) -> Result<(), T> {
+        match self.core.begin() {
+            Begin::Won => {
+                self.core.publish(value);
+                self.wake_all();
+                Ok(())
+            }
+            // The cell is initialized (or being initialized by someone else)
+            // and keeps what it has; std blocks on a concurrent initializer.
+            Begin::Busy => {
+                self.wait_ready();
+                Err(value)
+            }
+            Begin::Ready => Err(value),
+        }
+    }
+
+    /// Return the value, initializing it with `f` if the cell is empty.
+    ///
+    /// If several threads call this at once, exactly one `f` runs; the others
+    /// block and then receive that value.
+    pub fn get_or_init<F: FnOnce() -> T>(&self, f: F) -> &T {
+        match self.core.begin() {
+            Begin::Won => {
+                self.core.publish(f());
+                self.wake_all();
+            }
+            Begin::Busy => self.wait_ready(),
+            Begin::Ready => {}
+        }
+        self.core
+            .get()
+            .expect("OnceLock::get_or_init after publication")
+    }
+
+    /// Take the value out, leaving the cell empty and reusable.
+    pub fn take(&mut self) -> Option<T> {
+        self.core.take()
+    }
+
+    /// Consume the cell and return its value, if it has one.
+    pub fn into_inner(self) -> Option<T> {
+        // The `ManuallyDrop` is what lets `take` run on a type with a `Drop`
+        // impl: the value is read out exactly once and the cell itself is not
+        // dropped.
+        let mut this = ManuallyDrop::new(self);
+        this.core.take()
+    }
+
+    /// Park until the cell is READY. The predicate is re-checked under the
+    /// gate mutex, so a publication that lands between the check and the sleep
+    /// is still seen: the publisher has to take the same mutex before it
+    /// notifies.
+    fn wait_ready(&self) {
+        if self.core.is_ready() {
+            return;
+        }
+        let mut guard = self.gate.lock();
+        while !self.core.is_ready() {
+            guard = self.done.wait(guard);
+        }
+    }
+
+    /// Wake every parked initializer-waiter.
+    ///
+    /// The gate is held across the notification (the `Condvar` contract: the
+    /// sequence bump must not slip between a waiter's predicate check and its
+    /// futex word read).
+    fn wake_all(&self) {
+        let guard = self.gate.lock();
+        self.done.notify_all();
+        drop(guard);
+    }
+}
+
+impl<T> Default for OnceLock<T> {
+    /// An uninitialized cell, like `std`'s.
+    fn default() -> OnceLock<T> {
+        OnceLock::new()
+    }
+}
+
+impl<T> From<T> for OnceLock<T> {
+    /// An already-initialized cell, like `std`'s.
+    fn from(value: T) -> OnceLock<T> {
+        OnceLock {
+            core: Core::with_value(value),
+            gate: Mutex::new(()),
+            done: Condvar::new(),
+        }
+    }
+}
+
+impl<T: Clone> Clone for OnceLock<T> {
+    /// Clone the value if it has been published; otherwise a new empty cell.
+    fn clone(&self) -> OnceLock<T> {
+        match self.get() {
+            Some(value) => OnceLock::from(value.clone()),
+            None => OnceLock::new(),
+        }
+    }
+}
+
+impl<T: PartialEq> PartialEq for OnceLock<T> {
+    /// Two cells are equal when both are empty or both hold equal values.
+    fn eq(&self, other: &OnceLock<T>) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl<T: Eq> Eq for OnceLock<T> {}
+
+impl<T: fmt::Debug> fmt::Debug for OnceLock<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_tuple("OnceLock");
+        match self.get() {
+            Some(value) => debug.field(value),
+            None => debug.field(&format_args!("<uninit>")),
+        };
+        debug.finish()
+    }
+}
+
+impl<T> Drop for OnceLock<T> {
+    fn drop(&mut self) {
+        self.core.drop_value();
     }
 }

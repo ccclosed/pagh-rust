@@ -14,8 +14,9 @@
 //! narrower and testable: file I/O, directories, arguments/environment,
 //! monotonic time, paths, buffered I/O, formatting, exit codes, **a real
 //! open-addressing hash table** ([`collections`]), **native threads/futexes and
-//! scoped threads** ([`thread`]), **mutexes, rwlocks, condition variables, a
-//! bounded channel, barriers and `Once`** ([`sync`]), the ABI's IPv4 sockets —
+//! scoped threads** ([`thread`]), **a thread-safe `OnceLock`, mutexes, rwlocks,
+//! condition variables, a bounded channel, barriers and `Once`** ([`sync`]), the
+//! ABI's IPv4 sockets —
 //! **a TCP client, a TCP listener, UDP datagrams, a DNS stub resolver and
 //! `connect("host:port")`** ([`net`]) — **TLS 1.3 with fail-closed server
 //! authentication** ([`tls`], the kernel's own client through syscalls
@@ -84,8 +85,9 @@
 //! | [`process`] | `exit`, `abort`, `id`, `fork`/`execve`/`wait`, `Command` spawn/status/output |
 //! | [`time`] | `Duration`, monotonic `Instant`, uptime-based `SystemTime`, `UNIX_EPOCH`, `sleep`, `sleep_until` |
 //! | [`path`] | `Path`, `PathBuf`, `Component`, `Components`, lexical `normalize`/`normalize_join` |
+//! | [`rc`] | `Rc`/`Weak` re-exported from `alloc`, at the `std::rc` path |
 //! | [`collections`] | `Vec`, `String`, `VecDeque`, `BTreeMap`, `BTreeSet`, `BinaryHeap`, a real `HashMap`/`HashSet` |
-//! | [`sync`] | `Cell`, `RefCell`, `OnceCell`, `LazyLock`, futex-backed `Mutex`/`RwLock`/`Condvar`/`Barrier`/`Once`, bounded `mpsc` |
+//! | [`sync`] | `Cell`, `RefCell`, `OnceCell`, `LazyLock` (single-threaded), thread-safe `OnceLock`, `Arc`/`Weak`, futex-backed `Mutex`/`RwLock`/`Condvar`/`Barrier`/`Once`, bounded `mpsc` |
 //! | [`thread`] | native `Builder`/`JoinHandle`, futex wait/wake, `thread::scope` with borrowed closures |
 //! | [`net`] | `Ipv4`, `SocketAddr`, `TcpStream` (blocking/`WouldBlock`, timeouts, `try_clone`), `TcpListener`, `UdpSocket`, `dns`, `connect("host:port")` |
 //! | [`tls`] | TLS 1.3 over a `TcpStream` via the kernel's fail-closed client: `TlsStream` (`connect`, read/write, close), `https_get`, `http`; `vendored` (feature `vendored-tls`) is the 0.7.0 userland stack |
@@ -121,6 +123,7 @@ pub mod net;
 pub mod panic;
 pub mod path;
 pub mod process;
+pub mod rc;
 pub mod signal;
 pub mod sync;
 pub mod thread;
@@ -240,8 +243,9 @@ macro_rules! dbg {
 /// `use pagh_std::prelude::*;` brings in `Read`/`Write` (so `read!`-style
 /// method calls and `write!` work), the buffered and in-memory adapters
 /// (`BufReader`, `BufWriter`, `Cursor`, `Chain`, `Tee`), `Vec`/`String`,
-/// `Path`/`PathBuf`, the console types, `Duration`/`Instant`/`SystemTime`, the
-/// module names `env`, `fs`, `process`, `time`, and the macros.
+/// `Path`/`PathBuf`, the console types, `Arc`/`OnceLock`/`LazyLock`,
+/// `Duration`/`Instant`/`SystemTime`, the module names `env`, `fs`, `process`,
+/// `time`, and the macros.
 pub mod prelude {
     pub use alloc::borrow::ToOwned;
     pub use alloc::boxed::Box;
@@ -258,7 +262,7 @@ pub mod prelude {
     };
     pub use crate::path::{Path, PathBuf};
     pub use crate::process;
-    pub use crate::sync::{Cell, LazyLock, OnceCell, RefCell};
+    pub use crate::sync::{Arc, Cell, LazyLock, OnceCell, OnceLock, RefCell};
     pub use crate::time::{self, Duration, Instant, SystemTime, UNIX_EPOCH};
 
     pub use crate::{dbg, eprint, eprintln, format, print, println, vec};
