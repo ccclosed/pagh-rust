@@ -114,8 +114,8 @@ fi
 EXAMPLE_DIR="$ROOT/target/$TARGET/$PROFILE_DIR/examples"
 echo
 echo "ELF outputs (kernel image limit: 1 MiB):"
-for name in cat wc find threads_mutex spawn condvar io_traits io_adapters tcp_server udp_echo \
-    sync_primitives sync_once_lock hash_map dns socket_opts tls_get; do
+for name in cat wc find threads_mutex spawn condvar io_traits io_adapters io_writers \
+    tcp_server udp_echo sync_primitives sync_once_lock hash_map dns socket_opts tls_get; do
     path="$EXAMPLE_DIR/$name"
     if [ ! -f "$path" ]; then
         echo "build.sh: expected $path to exist" >&2
@@ -162,6 +162,7 @@ echo "  run /mnt/spawn"
 echo "  run /mnt/condvar"
 echo "  run /mnt/io_traits"
 echo "  run /mnt/io_adapters                   # 0.9.0: Cursor, Read::chain, Tee"
+echo "  run /mnt/io_writers                    # 0.11.0: Vec/&mut [u8]/cursor writers"
 echo "  run /mnt/tcp_server 45679 2                 # with --hostfwd 45679:45679"
 echo "  run /mnt/udp_echo 10.0.2.2 <port> 45680     # with --net and a host echo server"
 echo "  run /mnt/sync_primitives"

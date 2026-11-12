@@ -1,6 +1,6 @@
 [package]
 name = "pagh_std"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 publish = false
 description = "A std-like Rust layer over the pagh-riscv native ABI (libpagh)"
@@ -107,6 +107,12 @@ path = "../examples/io_traits.rs"
 [[example]]
 name = "io_adapters"
 path = "../examples/io_adapters.rs"
+
+# 0.11.0: the in-memory writers (`Vec<u8>`, `&mut [u8]`, the writer cursors)
+# and `BufRead for &[u8]`; `tools/live_110.py` runs it.
+[[example]]
+name = "io_writers"
+path = "../examples/io_writers.rs"
 
 [[example]]
 name = "tcp_server"

@@ -12,6 +12,9 @@
 //! * [`Cursor`] is an in-memory reader over any `T: AsRef<[u8]>`, with
 //!   [`Seek`]; [`Read::chain`] concatenates two readers; [`Tee`] mirrors a
 //!   writer into a second sink;
+//! * the in-memory implementations std gives its traits are here too: `Write`
+//!   for `Vec<u8>`, `&mut [u8]` and the writer cursors, and `BufRead` for
+//!   `&[u8]`, so a program can build or consume a byte buffer with no file;
 //! * [`stdin`] blocks by retrying `EAGAIN` with `sched_yield`. The kernel's
 //!   console `read(0)` is non-blocking; this handle keeps its historical yield
 //!   loop (the `poll` wrapper is available separately). The console has **no

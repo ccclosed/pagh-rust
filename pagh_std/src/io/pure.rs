@@ -9,6 +9,7 @@
 //! Keep it free of `crate::` references other than the two re-exports below
 //! (`error` and the root `Errno`), or the second build stops resolving.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -403,13 +404,18 @@ impl<S: Seek + ?Sized> Seek for &mut S {
 /// would land on a negative or overflowing position is
 /// [`ErrorKind::InvalidInput`], not a panic.
 ///
-/// # Deviations from std
+/// # Reader and writer cursors
 ///
-/// There is no `Write` implementation. std has one for `Cursor<&mut [u8]>`,
-/// `Cursor<Vec<u8>>` and `Cursor<Box<[u8]>>`; this type is bounded on
-/// `T: AsRef<[u8]>` only and is a **reader**. `consume` saturates instead of
-/// letting the position wrap, which is the same observable behaviour for every
-/// caller that respects the trait contract.
+/// The generic `Cursor<T>` is a reader (`Read`, `BufRead`, `Seek`). As in std,
+/// `Write` is implemented separately for the concrete in-memory writers:
+/// `Cursor<Vec<u8>>` and `Cursor<&mut Vec<u8>>` grow and zero-pad when the
+/// position is past the end, while `Cursor<&mut [u8]>`, `Cursor<[u8; N]>` and
+/// `Cursor<Box<[u8]>>` write into the fixed buffer and report a short write at
+/// its end (with `write_all` reporting [`ErrorKind::WriteZero`]). Writing needs
+/// either a growable vector or a fixed slice, which is exactly why std spells
+/// out the same separate impls. `consume` saturates instead of letting the
+/// position wrap, which is the same observable behaviour for every caller that
+/// respects the trait contract.
 #[derive(Clone, Debug, Default)]
 pub struct Cursor<T> {
     inner: T,
@@ -1023,6 +1029,212 @@ impl<W: Write, F: Write> Write for Tee<W, F> {
     fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
         self.file.flush()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-memory writers and readers
+// ---------------------------------------------------------------------------
+
+/// Writes into a `Vec<u8>` by appending, growing it as needed.
+///
+/// This is std's in-memory sink and its `write!` destination. Every byte is
+/// accepted — `write` never reports a short write — and an allocation failure
+/// is a typed [`ErrorKind::OutOfMemory`] instead of an abort, because the SDK
+/// maps `try_reserve` failures that way everywhere it can.
+impl Write for Vec<u8> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        self.try_reserve(buf.len())
+            .map_err(|_| Error::from(Errno::ENOMEM))?;
+        self.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        self.write(buf).map(|_| ())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Writes into a `&mut [u8]` by copying and then advancing the slice.
+///
+/// std's shape: the slice is updated to point at the not-yet-written part, so
+/// it is empty when full and `write` then returns `Ok(0)`; a write that does
+/// not fit is short, and `write_all` reports [`ErrorKind::WriteZero`] when the
+/// destination runs out.
+impl Write for &mut [u8] {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let n = core::cmp::min(buf.len(), self.len());
+        let (head, tail) = core::mem::take(self).split_at_mut(n);
+        head.copy_from_slice(&buf[..n]);
+        *self = tail;
+        Ok(n)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        if self.write(buf)? < buf.len() {
+            return Err(Error::new(
+                ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            ));
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Reads from the remaining part of a `&[u8]`.
+///
+/// std's shape: `fill_buf` returns the unread bytes, `consume` advances the
+/// slice, so `read_until`/`read_line`/`lines` work over a borrowed buffer
+/// without copying. `consume` is clamped to the available bytes (this SDK's
+/// trait contract) instead of panicking on an over-long count.
+impl BufRead for &[u8] {
+    fn fill_buf(&mut self) -> Result<&[u8]> {
+        Ok(*self)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        let n = core::cmp::min(amt, self.len());
+        *self = &self[n..];
+    }
+}
+
+/// Non-resizing cursor write: copy into `slice` at `pos`, clamped to its end.
+fn cursor_slice_write(pos: &mut u64, slice: &mut [u8], buf: &[u8]) -> usize {
+    let start = core::cmp::min(*pos, slice.len() as u64) as usize;
+    let n = core::cmp::min(buf.len(), slice.len() - start);
+    slice[start..start + n].copy_from_slice(&buf[..n]);
+    *pos += n as u64;
+    n
+}
+
+/// Resizing cursor write: grow and zero-pad the vector when `pos` is past its
+/// end, then write every byte (this cursor never reports a short write).
+fn cursor_vec_write(pos: &mut u64, vec: &mut Vec<u8>, buf: &[u8]) -> Result<()> {
+    let position = usize::try_from(*pos).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "cursor position exceeds the addressable length",
+        )
+    })?;
+    let end = position
+        .checked_add(buf.len())
+        .ok_or_else(|| Error::from(Errno::ENOMEM))?;
+    if end > vec.len() {
+        vec.try_reserve(end - vec.len())
+            .map_err(|_| Error::from(Errno::ENOMEM))?;
+    }
+    if position > vec.len() {
+        // std pads the gap with zero bytes; this is the one place a cursor
+        // invents data, and it is the documented behaviour.
+        vec.resize(position, 0);
+    }
+    let writable = core::cmp::min(buf.len(), vec.len() - position);
+    if writable > 0 {
+        vec[position..position + writable].copy_from_slice(&buf[..writable]);
+    }
+    if writable < buf.len() {
+        // Capacity was reserved above, so this cannot allocate.
+        vec.extend_from_slice(&buf[writable..]);
+    }
+    *pos += buf.len() as u64;
+    Ok(())
+}
+
+impl Write for Cursor<Vec<u8>> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        cursor_vec_write(&mut self.pos, &mut self.inner, buf)?;
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        self.write(buf).map(|_| ())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Write for Cursor<&mut Vec<u8>> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        cursor_vec_write(&mut self.pos, &mut *self.inner, buf)?;
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        self.write(buf).map(|_| ())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Write for Cursor<&mut [u8]> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        Ok(cursor_slice_write(&mut self.pos, &mut *self.inner, buf))
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        if self.write(buf)? < buf.len() {
+            return Err(Error::new(
+                ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            ));
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl<const N: usize> Write for Cursor<[u8; N]> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        Ok(cursor_slice_write(&mut self.pos, &mut self.inner[..], buf))
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        if self.write(buf)? < buf.len() {
+            return Err(Error::new(
+                ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            ));
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Write for Cursor<Box<[u8]>> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        Ok(cursor_slice_write(&mut self.pos, &mut self.inner[..], buf))
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        if self.write(buf)? < buf.len() {
+            return Err(Error::new(
+                ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            ));
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
