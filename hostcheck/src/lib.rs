@@ -1467,6 +1467,94 @@ mod io_090 {
     }
 
     #[test]
+    fn cursor_matches_a_reference_model_over_random_operations() {
+        // A deterministic sequence of reads, seeks and consumes against a
+        // slice-plus-position model of std's Cursor. The hand-written tests
+        // above pin the interesting boundaries; this one is free to wander
+        // across them and catch an off-by-one the enumerated cases missed.
+        fn next(state: &mut u64) -> u64 {
+            // xorshift64*: deterministic, no dependency, good enough to shuffle
+            // the operation order.
+            let mut x = *state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            *state = x;
+            x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        let data: alloc::vec::Vec<u8> = (0..37u8).map(|value| value.wrapping_mul(7)).collect();
+        let mut cursor = Cursor::new(data.clone());
+        let mut position: u64 = 0;
+        let mut state = 0x5eed_1234_abcd_9876u64;
+
+        for step in 0..4000 {
+            let choice = next(&mut state) % 6;
+            match choice {
+                0 | 1 => {
+                    // Read into a variable-size buffer.
+                    let mut buffer = [0u8; 8];
+                    let length = (next(&mut state) % 9) as usize;
+                    let read = cursor.read(&mut buffer[..length]).unwrap();
+                    let start = core::cmp::min(position as usize, data.len());
+                    let expected = core::cmp::min(length, data.len() - start);
+                    assert_eq!(read, expected, "read length at step {step}");
+                    assert_eq!(&buffer[..read], &data[start..start + expected]);
+                    position += expected as u64;
+                }
+                2 => {
+                    // Peek through BufRead and consume a random count.
+                    {
+                        let window = cursor.fill_buf().unwrap();
+                        let start = core::cmp::min(position as usize, data.len());
+                        assert_eq!(window, &data[start..], "fill_buf at step {step}");
+                    }
+                    let amount = (next(&mut state) % 12) as usize;
+                    cursor.consume(amount);
+                    position = position.saturating_add(amount as u64);
+                }
+                3 => {
+                    let target = next(&mut state) % 37;
+                    assert_eq!(cursor.seek(SeekFrom::Start(target)).unwrap(), target);
+                    position = target;
+                }
+                4 => {
+                    let delta = (next(&mut state) % 41) as i64 - 20;
+                    let expected = position as i128 + delta as i128;
+                    if expected < 0 {
+                        assert_eq!(
+                            cursor.seek(SeekFrom::Current(delta)).unwrap_err().kind(),
+                            ErrorKind::InvalidInput,
+                            "negative relative seek at step {step}"
+                        );
+                    } else {
+                        assert_eq!(
+                            cursor.seek(SeekFrom::Current(delta)).unwrap(),
+                            expected as u64
+                        );
+                        position = expected as u64;
+                    }
+                }
+                _ => {
+                    let delta = (next(&mut state) % 41) as i64 - 20;
+                    let expected = data.len() as i128 + delta as i128;
+                    if expected < 0 {
+                        assert_eq!(
+                            cursor.seek(SeekFrom::End(delta)).unwrap_err().kind(),
+                            ErrorKind::InvalidInput,
+                            "negative end seek at step {step}"
+                        );
+                    } else {
+                        assert_eq!(cursor.seek(SeekFrom::End(delta)).unwrap(), expected as u64);
+                        position = expected as u64;
+                    }
+                }
+            }
+            assert_eq!(cursor.position(), position, "position at step {step}");
+        }
+    }
+
+    #[test]
     fn cursor_and_chain_are_usable_through_the_trait_objects_they_share() {
         // `Read` is not object-safe (`read_to_end` needs `Self: Sized` only for
         // the adapters, not for `read`), but the concrete composition has to

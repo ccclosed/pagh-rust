@@ -263,7 +263,7 @@ The pure logic can be compiled for the host; `libpagh` itself cannot
 `path.rs`, `hash.rs`, `collections/{hash_map,hash_set}.rs`, `lazy.rs`,
 `net/dns_wire.rs`, `tls/{url,http}.rs`, the vendored `tls/vendored/hostname.rs`
 and, since 0.9.0, `error.rs` plus the kernel-independent half of the I/O
-module, `io/pure.rs` — 69 checks:
+module, `io/pure.rs` — 70 checks:
 
 ```sh
 cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu
@@ -987,8 +987,8 @@ hashes included). `python3 tools/live_080.py` reproduces the 0.8.0
 kernel-backed TLS matrix and rewrites `docs/live-sdk-0.8.0.txt` (**32/32
 checks**); `python3 tools/live_090.py` reproduces the 0.9.0 I/O-adapter matrix
 and rewrites `docs/live-sdk-0.9.0.txt` (**12/12 checks**). The host unit tests
-are **69 checks** (`cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`):
-the 40 from the earlier pure layers, 27 for the 0.9.0 I/O core, and the two
+are **70 checks** (`cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`):
+the 40 from the earlier pure layers, 28 for the 0.9.0 I/O core, and the two
 `Errno` round-trip tests that arrive with the sibling's `errno.rs` include.
 
 ## CI
