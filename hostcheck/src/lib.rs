@@ -885,7 +885,7 @@ mod pure_080 {
 mod io_090 {
     use super::error::{ErrorKind, Result};
     use super::io_pure::{
-        copy, read_to_end, BufRead, BufReader, Chain, Cursor, Read, Seek, Tee, Write,
+        copy, read_to_end, BufRead, BufReader, BufWriter, Chain, Cursor, Read, Seek, Tee, Write,
     };
     use super::libpagh_io::SeekFrom;
 
@@ -1372,6 +1372,98 @@ mod io_090 {
         reader.read_to_end(&mut rest).unwrap();
         assert_eq!(rest, b"56789");
         assert_eq!(reader.into_inner().into_inner(), payload.to_vec());
+    }
+
+    #[test]
+    fn cursor_default_and_get_mut_can_move_the_end() {
+        // `Default` is std's: an empty byte source at position 0.
+        let mut empty = Cursor::<alloc::vec::Vec<u8>>::default();
+        assert_eq!(empty.position(), 0);
+        assert_eq!(empty.fill_buf().unwrap(), b"");
+        assert_eq!(empty.read(&mut [0u8; 1]).unwrap(), 0);
+
+        // `get_mut` exposes the buffer; growing it moves the end of file, so a
+        // read started before the mutation sees the new bytes (std's behaviour
+        // for a `Cursor` over an owning container).
+        let mut cursor = Cursor::new(b"ab".to_vec());
+        cursor.get_mut().extend_from_slice(b"cd");
+        let mut all = alloc::vec::Vec::new();
+        assert_eq!(cursor.read_to_end(&mut all).unwrap(), 4);
+        assert_eq!(all, b"abcd");
+    }
+
+    #[test]
+    fn cursor_read_to_string_crosses_the_default_chunk_boundary() {
+        // `read_to_end`/`read_to_string` copy in 4096-byte chunks; a cursor has
+        // to serve the tail correctly when the payload is not a multiple of
+        // that, and `read_to_string` has to validate the whole run.
+        let text = "é".repeat(3000); // 6000 UTF-8 bytes, one byte pair per char
+        let mut cursor = Cursor::new(text.as_bytes().to_vec());
+        let mut out = alloc::string::String::new();
+        assert_eq!(cursor.read_to_string(&mut out).unwrap(), text.len());
+        assert_eq!(out, text);
+        assert_eq!(cursor.position(), text.len() as u64);
+        // A second read at EOF appends nothing and reports 0.
+        assert_eq!(cursor.read_to_string(&mut out).unwrap(), 0);
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn chain_reads_only_the_second_reader_once_the_first_is_finished() {
+        let mut chain = Cursor::new(b"ab".to_vec()).chain(Cursor::new(b"cdef".to_vec()));
+        let mut exactly = [0u8; 3];
+        chain.read_exact(&mut exactly).unwrap();
+        assert_eq!(&exactly, b"abc");
+        // The transition was consumed inside that `read_exact`; the first
+        // reader is now at its end and the chain serves `second` only.
+        assert_eq!(chain.read(&mut [0u8; 0]).unwrap(), 0);
+        let mut rest = alloc::vec::Vec::new();
+        assert_eq!(chain.read_to_end(&mut rest).unwrap(), 3);
+        assert_eq!(rest, b"def");
+        assert_eq!(chain.get_ref().1.position(), 4);
+    }
+
+    #[test]
+    fn chain_composes_with_take_and_bufreader() {
+        // `Take<Chain<..>>`: the limit is applied after the concatenation.
+        let mut limited = Cursor::new(b"hello ".to_vec())
+            .chain(Cursor::new(b"world".to_vec()))
+            .take(8);
+        let mut out = alloc::vec::Vec::new();
+        assert_eq!(limited.read_to_end(&mut out).unwrap(), 8);
+        assert_eq!(out, b"hello wo");
+
+        // `BufReader<Chain<..>>`: the buffer is refilled across the hand-off.
+        let mut reader = BufReader::with_capacity(
+            2,
+            Cursor::new(b"ab".to_vec()).chain(Cursor::new(b"cd".to_vec())),
+        );
+        assert_eq!(reader.fill_buf().unwrap(), &b"ab"[..]);
+        let mut all = alloc::vec::Vec::new();
+        reader.read_to_end(&mut all).unwrap();
+        assert_eq!(all, b"abcd");
+    }
+
+    #[test]
+    fn tee_works_with_buffered_sinks_and_flushes_both() {
+        // Both sinks are `BufWriter`s, so the bytes only reach the captures on
+        // `flush`; `Tee::flush` has to flush the writer first and the file
+        // second, and `into_inner` then hands both back in order.
+        let mut tee = Tee::new(
+            BufWriter::with_capacity(32, Capture::default()),
+            BufWriter::with_capacity(32, Capture::default()),
+        );
+        tee.write_all(b"buffered").unwrap();
+        assert_eq!(tee.get_ref().0.buffer(), b"buffered");
+        tee.flush().unwrap();
+        let (writer, file) = tee.into_inner();
+        let writer = writer.into_inner().expect("writer flush");
+        let file = file.into_inner().expect("file flush");
+        assert_eq!(writer.bytes, b"buffered");
+        assert_eq!(file.bytes, b"buffered");
+        // One flush each from `Tee::flush`; `BufWriter::into_inner` flushes
+        // again on its way out, which is why the count is two, not one.
+        assert_eq!((writer.flushes, file.flushes), (2, 2));
     }
 
     #[test]
