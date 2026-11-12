@@ -78,7 +78,7 @@
 //!
 //! | Module | Provides |
 //! |---|---|
-//! | [`io`] | `Read`, `Write`, `Seek`, `BufRead`, `BufReader`, `BufWriter`, stdin/stdout/stderr, `copy`, `read_to_end`, `read_to_string`, `Error`/`ErrorKind` |
+//! | [`io`] | `Read`, `Write`, `Seek`, `BufRead`, `BufReader`, `BufWriter`, `Cursor`, `Read::chain`, `Tee`, stdin/stdout/stderr, `copy`, `read_to_end`, `read_to_string`, `Error`/`ErrorKind` |
 //! | [`fs`] | `File`, `OpenOptions`, `ReadDir`/`Dir`, `DirEntry`, `FileType`, `Metadata`, read/write/copy, mkdir/remove/rename/link/symlink/readlink, lexical `canonicalize` |
 //! | [`env`] | `args`, `args_os` (lossy), `vars`, `var`, `current_dir`, `set_current_dir` (process-local), `temp_dir` |
 //! | [`process`] | `exit`, `abort`, `id`, `fork`/`execve`/`wait`, `Command` spawn/status/output |
@@ -128,6 +128,12 @@ pub mod time;
 pub mod tls;
 
 pub use crate::error::{Error, ErrorKind};
+
+// The ABI's frozen error type, re-exported through the crate root: `error.rs`
+// and `io/pure.rs` are compiled a second time by the host gate (`hostcheck`),
+// which cannot link `libpagh` (RISC-V `ecall` assembly) and stands this one
+// type in by including the sibling's own `errno.rs`.
+pub(crate) use libpagh::errno::Errno;
 
 /// Implementation details used by this crate's macros; not a public API.
 #[doc(hidden)]
@@ -232,9 +238,10 @@ macro_rules! dbg {
 /// The std-shaped prelude: traits, common types and the formatting macros.
 ///
 /// `use pagh_std::prelude::*;` brings in `Read`/`Write` (so `read!`-style
-/// method calls and `write!` work), `Vec`/`String`, `Path`/`PathBuf`, the
-/// console types, `Duration`/`Instant`/`SystemTime`, the module names `env`,
-/// `fs`, `process`, `time`, and the macros.
+/// method calls and `write!` work), the buffered and in-memory adapters
+/// (`BufReader`, `BufWriter`, `Cursor`, `Chain`, `Tee`), `Vec`/`String`,
+/// `Path`/`PathBuf`, the console types, `Duration`/`Instant`/`SystemTime`, the
+/// module names `env`, `fs`, `process`, `time`, and the macros.
 pub mod prelude {
     pub use alloc::borrow::ToOwned;
     pub use alloc::boxed::Box;
@@ -246,7 +253,8 @@ pub mod prelude {
     pub use crate::env::{self, args, args_os, current_dir, var, vars};
     pub use crate::fs;
     pub use crate::io::{
-        self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Stderr, Stdin, Stdout, Write,
+        self, BufRead, BufReader, BufWriter, Chain, Cursor, Read, Seek, SeekFrom, Stderr, Stdin,
+        Stdout, Tee, Write,
     };
     pub use crate::path::{Path, PathBuf};
     pub use crate::process;

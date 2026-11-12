@@ -72,11 +72,13 @@ jobs:
       - name: Check the kernel 1 MiB image limit
         working-directory: pagh-rust
         # Every example that a default build produces, including 0.8.0's
-        # kernel-backed `tls_get` (284 KiB debug — it links no TLS stack at all).
+        # kernel-backed `tls_get` (284 KiB debug — it links no TLS stack at all)
+        # and 0.9.0's `io_adapters` (225 KiB; the I/O conveniences are userland
+        # only and link nothing new).
         run: |
           set -euo pipefail
-          for elf in cat wc find threads_mutex spawn condvar io_traits tcp_server udp_echo \
-                     sync_primitives hash_map dns socket_opts tls_get; do
+          for elf in cat wc find threads_mutex spawn condvar io_traits io_adapters \
+                     tcp_server udp_echo sync_primitives hash_map dns socket_opts tls_get; do
             path="target/riscv64gc-unknown-none-elf/debug/examples/$elf"
             size=$(wc -c <"$path")
             echo "$path: $size bytes"
@@ -101,7 +103,7 @@ jobs:
             test "$size" -le 1048576
           done
 
-      - name: Host tests for the pure path logic
+      - name: Host tests for the pure logic
         working-directory: pagh-rust
         # The host crate itself has no third-party dependencies, but the
         # workspace lockfile still names the sibling `libpagh`, so --locked
@@ -120,6 +122,7 @@ jobs:
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/spawn
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/condvar
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/io_traits
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/io_adapters
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/tcp_server
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/udp_echo
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/sync_primitives
