@@ -14,9 +14,16 @@
 //!
 //! The subset is std-shaped: [`Path::join`], [`Path::parent`],
 //! [`Path::file_name`], [`Path::file_stem`], [`Path::extension`],
-//! [`Path::components`], [`Path::display`], `PathBuf::push`/`pop` and the
+//! [`Path::components`], [`Path::starts_with`], [`Path::strip_prefix`],
+//! [`Path::ancestors`], [`Path::display`], `PathBuf::push`/`pop` and the
 //! `with_*`/`set_*` mutators. It is not `std::path` byte-for-byte: there is no
-//! `OsStr`, no Windows prefix, no `strip_prefix`/`starts_with` yet.
+//! `OsStr` and no Windows prefix, and [`Path::components`] deliberately yields
+//! a `CurDir` for an empty path and for every interior `.` (std yields none for
+//! an empty path and skips interior dots), because the normalization helpers
+//! read it textually. The query APIs -- `starts_with`, `strip_prefix`,
+//! `ancestors`, `parent`, `file_name` and the `*_stem`/`extension` pair -- use
+//! a private std-shaped scanner instead, so their edge cases (empty paths,
+//! repeated separators, trailing `.` components, `.`/`..`) match std.
 
 use alloc::borrow::Cow;
 use alloc::string::{String, ToString};
@@ -122,6 +129,146 @@ impl<'a> Iterator for Components<'a> {
     }
 }
 
+/// Iterator returned by [`Path::ancestors`].
+#[derive(Clone, Debug)]
+pub struct Ancestors<'a> {
+    next: Option<&'a Path>,
+}
+
+impl<'a> Iterator for Ancestors<'a> {
+    type Item = &'a Path;
+
+    fn next(&mut self) -> Option<&'a Path> {
+        let current = self.next?;
+        // `parent` borrows through `current`, so the item and the next step
+        // share the `'a` of the path this iterator was created from.
+        self.next = current.parent();
+        Some(current)
+    }
+}
+
+/// Error returned by [`Path::strip_prefix`] when `base` is not a prefix of the
+/// path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StripPrefixError(());
+
+impl fmt::Display for StripPrefixError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("prefix not found")
+    }
+}
+
+impl core::error::Error for StripPrefixError {}
+
+/// Component scanner used by [`Path::starts_with`] and [`Path::strip_prefix`].
+///
+/// [`Components`] yields a `CurDir` for an empty path and for every interior
+/// `.`, which is what the normalization code wants but not how `std::path`
+/// compares prefixes. This iterator follows `std::path::Components`: an empty
+/// path has no components, a `.` is `CurDir` only as the first component of a
+/// relative path, every other `.` is skipped, and repeated or trailing `/`
+/// disappears. It also tracks the byte position after the last produced
+/// component, so `strip_prefix` can return a borrowed remainder.
+struct PathTokens<'a> {
+    text: &'a str,
+    pos: usize,
+    started: bool,
+}
+
+impl<'a> PathTokens<'a> {
+    fn new(text: &'a str) -> PathTokens<'a> {
+        PathTokens {
+            text,
+            pos: 0,
+            started: false,
+        }
+    }
+}
+
+impl<'a> Iterator for PathTokens<'a> {
+    type Item = Component<'a>;
+
+    fn next(&mut self) -> Option<Component<'a>> {
+        let bytes = self.text.as_bytes();
+        if !self.started {
+            self.started = true;
+            if bytes.first() == Some(&b'/') {
+                while bytes.get(self.pos) == Some(&b'/') {
+                    self.pos += 1;
+                }
+                return Some(Component::RootDir);
+            }
+        }
+        loop {
+            while bytes.get(self.pos) == Some(&b'/') {
+                self.pos += 1;
+            }
+            if self.pos >= bytes.len() {
+                return None;
+            }
+            let start = self.pos;
+            while self.pos < bytes.len() && bytes[self.pos] != b'/' {
+                self.pos += 1;
+            }
+            match &self.text[start..self.pos] {
+                // A leading `.` survives as `CurDir`; an interior one (`a/./b`)
+                // is normalized away, as std does.
+                "." if start == 0 => return Some(Component::CurDir),
+                "." => continue,
+                ".." => return Some(Component::ParentDir),
+                other => return Some(Component::Normal(other)),
+            }
+        }
+    }
+}
+
+/// The last std-shaped component of `text` and its byte offset.
+///
+/// Trailing separators and trailing `.` components do not produce a component,
+/// so `a/.` ends in `a`, exactly as std's `Components::next_back` sees it.
+/// Used by [`Path::parent`] and [`Path::file_name`].
+fn last_component(text: &str) -> Option<(Component<'_>, usize)> {
+    let mut tokens = PathTokens::new(text);
+    let mut last = None;
+    while let Some(component) = tokens.next() {
+        let end = tokens.pos;
+        let start = if component == Component::RootDir {
+            0
+        } else {
+            text[..end].rfind('/').map_or(0, |index| index + 1)
+        };
+        last = Some((component, start));
+    }
+    last
+}
+
+/// Trim `text[start..end]` the way `std::path::Components::as_path` trims the
+/// remainder: trailing separators and trailing `.` components disappear, but a
+/// root-only prefix keeps its `/`. Returns the new end offset, never below
+/// `start`.
+fn trim_component_end(text: &str, start: usize, end: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut end = end;
+    loop {
+        while end > 1 && bytes[end - 1] == b'/' {
+            end -= 1;
+        }
+        if end <= 1 || end <= start {
+            break;
+        }
+        let segment_start = match text[start..end].rfind('/') {
+            Some(index) => start + index + 1,
+            None => start,
+        };
+        if &text[segment_start..end] == "." {
+            end = segment_start;
+            continue;
+        }
+        break;
+    }
+    end.max(start)
+}
+
 /// A borrowed UTF-8 path.
 ///
 /// `Path` is an unsized type, exactly like `std::path::Path`: construct a
@@ -181,6 +328,88 @@ impl Path {
         self.components()
     }
 
+    /// True when `base` is a component-wise prefix of this path.
+    ///
+    /// `a/b` starts with `a` and with `a/`, but not with `ab`; an absolute
+    /// path never starts with a relative one (and vice versa). `.` and `..`
+    /// are ordinary components here, so the comparison is lexical, like the
+    /// rest of the module, and does not touch the filesystem. The empty path
+    /// is a prefix of everything.
+    pub fn starts_with<P: AsRef<Path>>(&self, base: P) -> bool {
+        let mut remaining = PathTokens::new(self.as_str());
+        for expected in PathTokens::new(base.as_ref().as_str()) {
+            match remaining.next() {
+                Some(component) if component == expected => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Remove `base` from the front of this path.
+    ///
+    /// Returns the rest of the path, borrowed from `self` and spelled as it is
+    /// there, or [`StripPrefixError`] when `base` is not a component-wise
+    /// prefix. The remainder is what std's `Components::as_path` returns:
+    /// leading separators and interior `.` components between the prefix and
+    /// the remainder are not part of it, and trailing separators or trailing
+    /// `.` components are trimmed (`a/b/` stripped of `a/b` is `""`,
+    /// `a/./` stripped of `a` is `""`). A prefix that covers the whole path
+    /// leaves the empty path; the empty prefix leaves the path with its
+    /// trailing separators trimmed (`a/b/` stripped of `""` is `a/b`), which
+    /// is also what std returns.
+    pub fn strip_prefix<P: AsRef<Path>>(&self, base: P) -> Result<&Path, StripPrefixError> {
+        let text = self.as_str();
+        let bytes = text.as_bytes();
+        let mut remaining = PathTokens::new(text);
+        let mut matched = 0usize;
+        for expected in PathTokens::new(base.as_ref().as_str()) {
+            match remaining.next() {
+                Some(component) if component == expected => matched += 1,
+                _ => return Err(StripPrefixError(())),
+            }
+        }
+        // Start of the remainder. With a non-empty prefix, `remaining.pos` sits
+        // just after the last matched component and the remainder begins at the
+        // next real component: separators and interior `.` components between
+        // the prefix and it are skipped. The empty prefix consumes nothing, so
+        // the whole path (including a leading `/` or `./`) is the remainder.
+        let mut start = 0;
+        if matched > 0 {
+            start = remaining.pos;
+            loop {
+                while bytes.get(start) == Some(&b'/') {
+                    start += 1;
+                }
+                if start >= bytes.len() {
+                    return Ok(Path::new(""));
+                }
+                let segment_start = start;
+                while start < bytes.len() && bytes[start] != b'/' {
+                    start += 1;
+                }
+                if &text[segment_start..start] != "." {
+                    start = segment_start;
+                    break;
+                }
+            }
+        }
+        // Right-trim like std's `Components::as_path`: trailing separators and
+        // trailing `.` components are not part of the remainder. A path that
+        // is only separators collapses to `/`, never to the empty path.
+        let end = trim_component_end(text, start, bytes.len());
+        Ok(Path::new(&text[start..end]))
+    }
+
+    /// Iterate over this path and its parents, ending with the empty path.
+    ///
+    /// The first item is `self` (spelled as it is); every following item is
+    /// the previous one's [`Path::parent`], so `/a/b` yields `/a/b`, `/a` and
+    /// `/`, while `a` yields `a` and `""`, and `""` yields only `""`.
+    pub fn ancestors(&self) -> Ancestors<'_> {
+        Ancestors { next: Some(self) }
+    }
+
     /// Append `path` to this one.
     ///
     /// An absolute `path` replaces the receiver, matching std. The result is
@@ -195,51 +424,28 @@ impl Path {
     /// The path without its final component.
     ///
     /// `None` for `/`, `""` and a path that is only `/`s; `Some("")` for a
-    /// single relative component, as std does.
+    /// single relative component, as std does. Trailing separators and trailing
+    /// `.` components are not components, so `a/.` has parent `""` and
+    /// `/a/./b` has parent `/a`, exactly like std.
     pub fn parent(&self) -> Option<&Path> {
         let text = self.as_str();
-        if text.is_empty() {
-            return None;
-        }
-        let mut end = text.len();
-        while end > 1 && text.as_bytes()[end - 1] == b'/' {
-            end -= 1;
-        }
-        let trimmed = &text[..end];
-        if trimmed == "/" {
-            return None;
-        }
-        match trimmed.rfind('/') {
-            None => Some(Path::new("")),
-            Some(0) => Some(Path::new("/")),
-            Some(index) => {
-                let mut dir_end = index;
-                while dir_end > 1 && trimmed.as_bytes()[dir_end - 1] == b'/' {
-                    dir_end -= 1;
-                }
-                Some(Path::new(&trimmed[..dir_end]))
+        match last_component(text)? {
+            (Component::Normal(_) | Component::CurDir | Component::ParentDir, start) => {
+                let end = trim_component_end(text, 0, start);
+                Some(Path::new(&text[..end]))
             }
+            (Component::RootDir, _) => None,
         }
     }
 
     /// The final component, unless it is `/`, `.` or `..`.
+    ///
+    /// This is std's `components().next_back()`: trailing separators and
+    /// trailing `.` components are skipped (`a/./` names `a`).
     pub fn file_name(&self) -> Option<&str> {
-        let text = self.as_str();
-        let mut end = text.len();
-        while end > 1 && text.as_bytes()[end - 1] == b'/' {
-            end -= 1;
-        }
-        let trimmed = &text[..end];
-        if trimmed.is_empty() || trimmed == "/" {
-            return None;
-        }
-        let name = match trimmed.rfind('/') {
-            Some(index) => &trimmed[index + 1..],
-            None => trimmed,
-        };
-        match name {
-            "" | "." | ".." => None,
-            other => Some(other),
+        match last_component(self.as_str())? {
+            (Component::Normal(name), _) => Some(name),
+            _ => None,
         }
     }
 

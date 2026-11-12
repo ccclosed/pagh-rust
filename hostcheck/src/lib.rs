@@ -112,6 +112,128 @@ mod tests {
         assert_eq!(Path::new("/a/b/").file_name(), Some("b"));
         assert_eq!(Path::new("/a/..").file_name(), None);
         assert_eq!(Path::new("/").file_name(), None);
+        // A trailing `.` component is not a component (std's next_back): the
+        // path before it is both the file name and the parent's tail.
+        assert_eq!(Path::new("a/.").file_name(), Some("a"));
+        assert_eq!(Path::new("a/./").file_name(), Some("a"));
+        assert_eq!(Path::new("a/.").parent().unwrap().as_str(), "");
+        assert_eq!(Path::new("a/./b").parent().unwrap().as_str(), "a");
+        assert_eq!(Path::new("/a/./b").parent().unwrap().as_str(), "/a");
+        assert_eq!(Path::new("///a").parent().unwrap().as_str(), "/");
+        assert_eq!(Path::new("//").parent(), None);
+        // Repeated separators and trailing dots do not survive into the parent.
+        assert_eq!(Path::new("a//b//").parent().unwrap().as_str(), "a");
+        assert_eq!(Path::new("../.").parent().unwrap().as_str(), "");
+        assert_eq!(Path::new("/a/..").parent().unwrap().as_str(), "/a");
+        // The extension family is built on `file_name`, so the same path now
+        // names the file before the trailing dot.
+        assert_eq!(Path::new("a.b/.").extension(), Some("b"));
+        assert_eq!(Path::new("a.b/./").file_stem(), Some("a"));
+        assert_eq!(Path::new("...").extension(), Some(""));
+        assert_eq!(Path::new("...").file_stem(), Some(".."));
+    }
+
+    #[test]
+    fn starts_with_compares_components() {
+        // The empty path is a prefix of everything; a non-empty base is not a
+        // prefix of it.
+        assert!(Path::new("").starts_with(""));
+        assert!(!Path::new("").starts_with("a"));
+        assert!(Path::new("a").starts_with(""));
+        // Whole components only: `a/` and `a` both match, `ab` does not.
+        assert!(Path::new("a/b").starts_with("a"));
+        assert!(Path::new("a/b").starts_with("a/"));
+        assert!(Path::new("/a/b").starts_with("/a/b/"));
+        assert!(!Path::new("a/b").starts_with("a/b/c"));
+        assert!(!Path::new("a").starts_with("ab"));
+        // Absolute and relative prefixes do not mix.
+        assert!(Path::new("/a/b").starts_with("/"));
+        assert!(!Path::new("/a/b").starts_with("a"));
+        assert!(!Path::new("a/b").starts_with("/a"));
+        // Repeated separators collapse and interior `.` components are
+        // normalized away, exactly like std's component comparison.
+        assert!(Path::new("/a//b").starts_with("/a"));
+        assert!(Path::new("a/./b").starts_with("a"));
+        assert!(Path::new("a/./b").starts_with("a/."));
+        assert!(Path::new("./a").starts_with("."));
+        assert!(!Path::new("a").starts_with("./a"));
+        // `.` and `..` are ordinary components here: lexical, no filesystem.
+        assert!(Path::new("a/../b").starts_with("a/.."));
+        assert!(!Path::new("a/../b").starts_with("a/../.."));
+    }
+
+    #[test]
+    fn strip_prefix_returns_a_borrowed_remainder() {
+        // The empty prefix consumes nothing: the whole path (possibly
+        // absolute) is the remainder, with trailing separators trimmed the way
+        // std's `Components::as_path` trims them.
+        assert_eq!(Path::new("").strip_prefix(""), Ok(Path::new("")));
+        assert_eq!(Path::new("a").strip_prefix(""), Ok(Path::new("a")));
+        assert_eq!(Path::new("/a/b").strip_prefix(""), Ok(Path::new("/a/b")));
+        assert_eq!(Path::new("a/b//").strip_prefix(""), Ok(Path::new("a/b")));
+        assert_eq!(Path::new("../").strip_prefix(""), Ok(Path::new("..")));
+        assert_eq!(Path::new("..//.").strip_prefix(""), Ok(Path::new("..")));
+        assert_eq!(Path::new("//a//").strip_prefix(""), Ok(Path::new("//a")));
+        assert_eq!(Path::new("///").strip_prefix(""), Ok(Path::new("/")));
+        // The remainder is spelled as in `self` with leading separators gone.
+        assert_eq!(Path::new("a/b").strip_prefix("a"), Ok(Path::new("b")));
+        assert_eq!(Path::new("a/b").strip_prefix("a/"), Ok(Path::new("b")));
+        assert_eq!(Path::new("a/b").strip_prefix("a/b"), Ok(Path::new("")));
+        assert_eq!(Path::new("a/b/").strip_prefix("a/b"), Ok(Path::new("")));
+        assert_eq!(Path::new("a//b").strip_prefix("a"), Ok(Path::new("b")));
+        assert_eq!(Path::new("a/./b").strip_prefix("a"), Ok(Path::new("b")));
+        assert_eq!(Path::new("a/./b").strip_prefix("a/."), Ok(Path::new("b")));
+        // Interior spelling of the *remainder* is kept; only its edges are
+        // normalized (`a//b//c` keeps the `//` between `b` and `c`).
+        assert_eq!(
+            Path::new("a//b//c").strip_prefix("a"),
+            Ok(Path::new("b//c"))
+        );
+        assert_eq!(
+            Path::new("a/./b/./c").strip_prefix("a"),
+            Ok(Path::new("b/./c"))
+        );
+        // Trailing separators and trailing `.` components are trimmed, like
+        // std's `Components::as_path`.
+        assert_eq!(Path::new("a/b/./").strip_prefix("a/b"), Ok(Path::new("")));
+        assert_eq!(Path::new("a/b/.").strip_prefix("a"), Ok(Path::new("b")));
+        assert_eq!(Path::new("/a//b//").strip_prefix("/a"), Ok(Path::new("b")));
+        assert_eq!(Path::new("../../").strip_prefix(".."), Ok(Path::new("..")));
+        assert_eq!(Path::new("./a").strip_prefix("."), Ok(Path::new("a")));
+        assert_eq!(Path::new("a/.").strip_prefix("a"), Ok(Path::new("")));
+        assert_eq!(Path::new("/a/b").strip_prefix("/"), Ok(Path::new("a/b")));
+        assert_eq!(Path::new("/a//b").strip_prefix("/a"), Ok(Path::new("b")));
+        assert_eq!(Path::new("//a").strip_prefix("/a"), Ok(Path::new("")));
+        // `..` matches lexically, and the rest is still `..`-relative.
+        assert_eq!(Path::new("a/../b").strip_prefix("a"), Ok(Path::new("../b")));
+        assert_eq!(Path::new("a/../b").strip_prefix("a/.."), Ok(Path::new("b")));
+        assert_eq!(Path::new("/").strip_prefix("/"), Ok(Path::new("")));
+        // A component-wise mismatch is an error, never a byte prefix match.
+        assert!(Path::new("a/b").strip_prefix("/a").is_err());
+        assert!(Path::new("a").strip_prefix("a/b").is_err());
+        assert!(Path::new("ab").strip_prefix("a").is_err());
+        // The opaque error type renders like std's.
+        let error = Path::new("a").strip_prefix("a/b").unwrap_err();
+        assert_eq!(alloc::format!("{}", error), "prefix not found");
+        assert_eq!(alloc::format!("{:?}", error), "StripPrefixError(())");
+    }
+
+    #[test]
+    fn ancestors_end_with_the_empty_path() {
+        fn ancestors(path: &str) -> alloc::vec::Vec<alloc::string::String> {
+            Path::new(path)
+                .ancestors()
+                .map(|parent| alloc::string::String::from(parent.as_str()))
+                .collect()
+        }
+        assert_eq!(ancestors(""), [""]);
+        assert_eq!(ancestors("/"), ["/"]);
+        assert_eq!(ancestors("a"), ["a", ""]);
+        assert_eq!(ancestors("/a/b"), ["/a/b", "/a", "/"]);
+        // The first item keeps the path's spelling; parents do not.
+        assert_eq!(ancestors("a/b/"), ["a/b/", "a", ""]);
+        assert_eq!(ancestors("/a//b"), ["/a//b", "/a", "/"]);
+        assert_eq!(ancestors("a/../b"), ["a/../b", "a/..", "a", ""]);
     }
 
     #[test]

@@ -21,13 +21,15 @@ use libpagh::errno::Errno;
 /// `BadFileDescriptor` is pagh-specific in name; std folds the same condition
 /// into `Uncategorized` today.
 ///
-/// `libpagh`'s frozen errno table has no `EADDRINUSE`, `EADDRNOTAVAIL` or
-/// `EMSGSIZE` entry, and it does not carry an unmapped number through (such a
-/// result becomes [`Errno::Unknown`], whose raw value is 0 and whose message is
-/// `Unknown error (outside the pagh ABI)`). A bind conflict, a non-local bind
-/// address or a datagram above the kernel's 1024-byte ceiling therefore arrives
-/// as [`ErrorKind::Uncategorized`]; the kernel did report the specific errno,
-/// and the SDK cannot see it.
+/// `libpagh` 0.6.0's frozen errno table has no `EADDRINUSE`, `EADDRNOTAVAIL`,
+/// `EMSGSIZE`, `ESRCH`, `EINTR`, `E2BIG`, `ENOEXEC`, `ECHILD` or
+/// `EDESTADDRREQ` entry; a number outside the table arrives as
+/// [`Errno::Unknown`] (raw 0, message `Unknown error (outside the pagh ABI)`).
+/// 0.6.1 records the errnos the kernel always returned, so this crate supports
+/// both: the variants it names directly are the 0.6.0 set, and the 0.6.1
+/// additions are matched in [`ErrorKind::from_errno`] by their frozen number,
+/// which keeps the build working against the pinned sibling while a newer one
+/// gets the typed kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(missing_docs)]
 pub enum ErrorKind {
@@ -48,6 +50,10 @@ pub enum ErrorKind {
     WriteZero,
     /// The operation would block; on fd 0 this means "no byte queued yet".
     WouldBlock,
+    /// A blocking call returned early because a signal handler is about to run
+    /// (`EINTR`, libpagh 0.6.1). The SDK's own wait loops do not restart on it
+    /// yet, because no signal handler can be installed through this SDK.
+    Interrupted,
     /// The 1 MiB `brk` heap could not grow (`ENOMEM`).
     OutOfMemory,
     /// The filesystem is full (`ENOSPC`).
@@ -63,6 +69,8 @@ pub enum ErrorKind {
     /// The name is longer than the ABI's 256-byte path limit
     /// (`ENAMETOOLONG`).
     InvalidFilename,
+    /// `execve` was given an over-long argv/envp (`E2BIG`, libpagh 0.6.1).
+    ArgumentListTooLong,
     /// Too many symbolic links (`ELOOP`).
     FilesystemLoop,
     /// The other end of a pipe/socket is gone (`EPIPE`).
@@ -83,6 +91,12 @@ pub enum ErrorKind {
     NetworkUnreachable,
     /// ARP could not resolve the next hop (`EHOSTUNREACH`).
     HostUnreachable,
+    /// `bind` names a port another socket already owns (`EADDRINUSE`,
+    /// libpagh 0.6.1).
+    AddrInUse,
+    /// `bind` names an address this interface does not hold (`EADDRNOTAVAIL`,
+    /// libpagh 0.6.1).
+    AddrNotAvailable,
     /// The ABI has no syscall for this operation (`ENOSYS`, `ENOTSUP`), or the
     /// SDK chose not to emulate it because doing so would be unsound or
     /// misleading.
@@ -95,6 +109,12 @@ pub enum ErrorKind {
 
 impl ErrorKind {
     /// Map a frozen [`Errno`] to its error class.
+    ///
+    /// `unreachable_patterns` is allowed because whether the final wildcard is
+    /// reachable depends on the sibling `pagh-api`'s `Errno` variant count:
+    /// against 0.6.0 every variant is named above, against 0.6.1 the wildcard
+    /// maps the added numbers. One build must stay warning-free with both.
+    #[allow(unreachable_patterns)]
     pub const fn from_errno(errno: Errno) -> ErrorKind {
         match errno {
             Errno::EPERM => ErrorKind::PermissionDenied,
@@ -138,6 +158,26 @@ impl ErrorKind {
                 ErrorKind::Uncategorized
             }
             Errno::ENOPROTOOPT => ErrorKind::Unsupported,
+            // libpagh 0.6.1 records the errnos the kernel already returned.
+            // Naming its variants here would make this crate fail to compile
+            // against the pinned 0.6.0, so the additions are matched by their
+            // frozen number: 0.6.0 never produces them (`from_raw` yields
+            // `Unknown`), and 0.6.1 gets the typed kind from the same build.
+            other => match other.raw() {
+                // EINTR: a blocking wait was interrupted by a signal.
+                4 => ErrorKind::Interrupted,
+                // E2BIG: execve refused an over-long argv/envp.
+                7 => ErrorKind::ArgumentListTooLong,
+                // EDESTADDRREQ (sendto with no peer) and EMSGSIZE (a datagram
+                // above the ABI's 1024-byte ceiling) are bad-call arguments.
+                89 | 90 => ErrorKind::InvalidInput,
+                // EADDRINUSE / EADDRNOTAVAIL: the bind conflict the socket
+                // layer used to report as Uncategorized.
+                98 => ErrorKind::AddrInUse,
+                99 => ErrorKind::AddrNotAvailable,
+                // ESRCH, ENOEXEC and ECHILD have no std-shaped class here.
+                _ => ErrorKind::Uncategorized,
+            },
         }
     }
 }
