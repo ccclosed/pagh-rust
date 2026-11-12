@@ -113,6 +113,20 @@ def info(message: str) -> None:
     print(f"live_080: {message}", file=sys.stderr)
 
 
+def kernel_package_version(pagh_riscv: pathlib.Path) -> str:
+    """Read the kernel crate's version for the transcript header.
+
+    The transcript is an acceptance artifact: it has to name the kernel it was
+    booted from, not a version that was baked in when this tool was written.
+    """
+    try:
+        text = (pagh_riscv / "Cargo.toml").read_text(encoding="utf-8")
+    except OSError:
+        return "unknown"
+    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    return match.group(1) if match else "unknown"
+
+
 def sha256(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -645,6 +659,7 @@ def write_transcript(
         "",
         f"date:               {started}",
         f"kernel:             {args.kernel} sha256 {kernel_hash}",
+        f"kernel package:     pagh-riscv {kernel_package_version(args.pagh_riscv)} (Cargo.toml)",
         f"kernel launcher:    pagh-riscv/tools/run.py --net --keep (guest 10.0.2.15/24)",
         f"guest image:        `mke2fs -q -t ext2 -F -b 4096 -d <rootfs>`",
         f"staging root:       {', '.join(EXAMPLES)}, etc/resolv.conf (nameserver "
