@@ -35,15 +35,32 @@ What *is* fully real is **Rust the language** plus the `alloc` crate:
 - **userland I/O conveniences** (0.9.0): `io::Cursor` over any
   `T: AsRef<[u8]>` with `Read`/`BufRead`/`Seek`, `Read::chain`, and a `Tee`
   writer that mirrors into a second sink. All three are std-shaped, need no
-  syscall, and are covered by the host gate as well as by a live boot.
+  syscall, and are covered by the host gate as well as by a live boot;
+- **thread-safe `OnceLock` and the `alloc` reference counters** (0.10.0): a
+  futex-backed `sync::OnceLock` (the last userland item on the old absent
+  list, `static`-able and never poisoned), `sync::Arc`/`Weak` and
+  `rc::Rc`/`Weak` at the `std` paths, and a `LazyLock` that stays
+  single-threaded (a documented deviation) but gains `Default`. The atomic
+  state machine behind `OnceLock` is plain `core`, so the host gate races it
+  with real threads; only the parking half is target-only.
 
 `pagh_std` does **not** claim to be `std`, does not provide dynamic linking or
 `OsStr`, and returns a typed `io::ErrorKind::Unsupported` for operations the
 ABI cannot express. Those are listed under
 [Limitations vs std](#limitations-vs-std).
 
-**Live evidence:** [`docs/live-sdk-0.9.0.txt`](docs/live-sdk-0.9.0.txt) is the
-QEMU serial transcript for 0.9.0 — one boot against `pagh-riscv 0.21.0` that
+**Live evidence:** [`docs/live-sdk-0.10.0.txt`](docs/live-sdk-0.10.0.txt) is the
+QEMU serial transcript for 0.10.0 — one boot against `pagh-riscv 0.21.2` that
+runs the `sync_once_lock` matrix, **13/13 checks passed**: four native threads
+racing `OnceLock::get_or_init` (exactly one initializer runs), a `set` race with
+one winner and three `Err(value)`, `wait()` parking the main thread until a
+second thread publishes, `take`/`into_inner`/`clone`/`Default`/reuse,
+`LazyLock` with its new `Default`, `Rc`/`Weak` counting, and `Arc`/`Weak`
+across four threads including `Arc<Mutex<u32>>` and `Arc::try_unwrap`.
+
+The 0.9.0 transcript remains the evidence for that release:
+[`docs/live-sdk-0.9.0.txt`](docs/live-sdk-0.9.0.txt) is the
+QEMU serial transcript — one boot against `pagh-riscv 0.21.0` that
 runs the `io_adapters` matrix, **12/12 checks passed**: `Cursor` reads and
 seeks across buffer boundaries *in the guest*, `Chain` concatenates two
 cursors, the empty cases and a real `File`, and `Tee` mirrors a line into
@@ -112,10 +129,14 @@ pagh_std/src/
   collections/             alloc containers + the real HashMap/HashSet
                            (Robin Hood probing, backward-shift deletion)
   hash.rs                  core::hash re-exports + deterministic hasher
-  lazy.rs                  single-threaded LazyLock (pure core; host-tested)
-  sync.rs                  Cell/RefCell/OnceCell + futex Mutex/RwLock/Condvar,
-                           Barrier, Once
+  lazy.rs                  single-threaded LazyLock + Default (pure; host-tested)
+  sync.rs                  Cell/RefCell/OnceCell, thread-safe OnceLock, futex
+                           Mutex/RwLock/Condvar, Barrier, Once, Arc/Weak
+  sync/once_lock_core.rs   the atomic state machine behind OnceLock (pure;
+                           host-tested, raced with real host threads)
+  sync/arc.rs              Arc/Weak re-export at the std::sync path (pure)
   sync/mpsc.rs             bounded Sender/Receiver channel over Mutex+Condvar
+  rc.rs                    Rc/Weak re-export at the std::rc path (pure)
   thread.rs                Builder/JoinHandle/futex + thread::scope
   net.rs                   Ipv4/SocketAddr, TcpStream/TcpListener/UdpSocket,
                            socket options, connect(host:port)
@@ -133,11 +154,11 @@ pagh_std/src/
   ffi.rs                   c_* types, CStr/CString
 examples/                  cat, wc, find, threads_mutex, spawn, condvar, io_traits,
                            io_adapters, tcp_server, udp_echo, sync_primitives,
-                           hash_map, dns, socket_opts, tls_get,
+                           sync_once_lock, hash_map, dns, socket_opts, tls_get,
                            tls_get_vendored (feature-gated)
 hostcheck/                 host cargo test for the pure modules (path, hash,
                            collections, lazy, dns_wire, tls url/http/hostname,
-                           io core + error)
+                           io core + error, OnceLock state machine, Rc/Arc)
 tools/probes/              panic/oom/chdir/fsops/clock diagnostic programs
 tools/live_check.py        builds, boots QEMU, runs the 0.4.0 filesystem matrix
 tools/live_070.py          the 0.7.0 live matrix: hash map, DNS, socket
@@ -147,6 +168,8 @@ tools/live_080.py          the 0.8.0 live matrix: the kernel-backed TLS
                            seeded from getrandom (one boot, one transcript)
 tools/live_090.py          the 0.9.0 live matrix: Cursor/Chain/Tee in one
                            boot, including the Tee file read back by `cat`
+tools/live_100.py          the 0.10.0 live matrix: OnceLock races, wait(),
+                           LazyLock, Rc/Arc in one boot
 tools/live_net.py          the 0.6.0 network/sync live matrix (one boot, one
                            command at a time, host peers, docs/ transcript)
 .github/workflows/ci.yml   fmt + RISC-V build + host tests
@@ -157,6 +180,7 @@ docs/live-sdk-0.7.0.txt    the 0.7.0 captured run (55/55: hash map, DNS,
                            socket options, vendored TLS 1.3)
 docs/live-sdk-0.8.0.txt    the 0.8.0 captured run (32/32: kernel-backed TLS)
 docs/live-sdk-0.9.0.txt    the 0.9.0 captured run (12/12: Cursor, Chain, Tee)
+docs/live-sdk-0.10.0.txt   the 0.10.0 captured run (13/13: OnceLock, Rc/Arc)
 ```
 
 ## A program
@@ -227,6 +251,7 @@ target/riscv64gc-unknown-none-elf/debug/examples/dns                     301 KiB
 target/riscv64gc-unknown-none-elf/debug/examples/socket_opts             261 KiB
 target/riscv64gc-unknown-none-elf/debug/examples/tls_get                 284 KiB
 target/riscv64gc-unknown-none-elf/debug/examples/io_adapters             225 KiB
+target/riscv64gc-unknown-none-elf/debug/examples/sync_once_lock          210 KiB
 target/riscv64gc-unknown-none-elf/release/examples/tls_get_vendored      760 KiB
 ```
 
@@ -263,7 +288,8 @@ The pure logic can be compiled for the host; `libpagh` itself cannot
 `path.rs`, `hash.rs`, `collections/{hash_map,hash_set}.rs`, `lazy.rs`,
 `net/dns_wire.rs`, `tls/{url,http}.rs`, the vendored `tls/vendored/hostname.rs`
 and, since 0.9.0, `error.rs` plus the kernel-independent half of the I/O
-module, `io/pure.rs` — 70 checks:
+module, `io/pure.rs`; 0.10.0 adds `sync/once_lock_core.rs` (the atomic state
+machine behind `OnceLock`), `rc.rs` and `sync/arc.rs` — 77 checks:
 
 ```sh
 cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu
@@ -277,8 +303,14 @@ exception: `libpagh::io` also holds the syscall-backed console handles, so the
 host crate spells out that std-shaped three-variant enum; on the target
 `pagh_std::io::SeekFrom` is `libpagh::io::SeekFrom`.
 
+`OnceLock` shows the same split for synchronization: the state word and storage
+are syscall-free, so this gate races them with six real host threads (where
+preemption exists) and checks the CAS protocol; the futex park/unpark half lives
+in `sync.rs` on top of `libpagh`, and the live matrix covers it with the SDK's
+own threads. `Arc` is exercised across real host threads too.
+
 CI runs that plus `cargo fmt -p pagh_std -p pagh_hostcheck -p pagh_probes --
---check`, `./build.sh --fixtures`, a 1 MiB size check for all fifteen debug
+--check`, `./build.sh --fixtures`, a 1 MiB size check for all sixteen debug
 examples, and `./build.sh --release --vendored` with a size check for
 `tls_get_vendored` (release-only: its debug build is over the limit). (The package-scoped
 form is deliberate: `cargo fmt --all` also formats local path dependencies, and
@@ -434,6 +466,19 @@ python3 tools/live_090.py --skip-build --keep-work
 | `run /mnt/io_adapters` | the example's three sections print `Cursor`/`Chain`/`Tee` `ok` and `IO_ADAPTERS PASS` (exit 0): `Cursor` reads and seeks across buffer boundaries in the guest, `Chain` covers two cursors, both empty cases and a real `File`, `Tee` mirrors one line to `stdout` **and** `/mnt/io_adapters_tee.txt` |
 | `run /mnt/io_adapters` again | the file is truncated and rewritten, not appended (checked by the count below) |
 | `run /mnt/cat /mnt/io_adapters_tee.txt` | a *different* program reads the file half; the transcript holds exactly one copy of the mirrored line and `cat` exits 0 |
+
+For 0.10.0 the live check is `tools/live_100.py`, one boot for the
+synchronization additions:
+
+```sh
+python3 tools/live_100.py                     # builds, boots, drives, writes docs/
+python3 tools/live_100.py --skip-build --keep-work
+```
+
+| what the boot proves | |
+|---|---|
+| `run /mnt/sync_once_lock` | four native threads race `OnceLock::get_or_init` and **one** initializer runs; a `set` race produces one `Ok(())` and three `Err(value)`; `wait()` parks the main thread until a second thread sets the value; `take`/`into_inner`/`clone`/`Default`/reuse; `LazyLock` with `Default`; `Rc`/`Weak` counting; `Arc`/`Weak` across four threads with `Arc<Mutex<u32>>` and `Arc::try_unwrap` — `SYNC_ONCE_LOCK PASS` / exit 0 |
+| the same command again | the checks are deterministic, so a second PASS shows the run is repeatable rather than a one-shot timing accident |
 
 ## API surface
 
@@ -594,9 +639,35 @@ hostile.
 ### `pagh_std::sync`
 
 `Cell`, `RefCell`, `OnceCell`, `UnsafeCell` from `core::cell`, a
-single-threaded `LazyLock<T, F>`, and **real futex-backed `Mutex<T>`/`RwLock<T>`**
+single-threaded `LazyLock<T, F>`, a thread-safe `OnceLock<T>`, `Arc`/`Weak`
+(the `alloc` types, at the `std::sync` path) and **real futex-backed
+`Mutex<T>`/`RwLock<T>`**
 (non-poisoning, process-private; guards implement `Deref`/`DerefMut`). They work
 with native threads and sleep on the futex word rather than spinning.
+
+`OnceLock<T>` is std's cell: `new` (const, so it works in a `static`), `get`
+(lock-free, never blocks), `get_mut`, `set` (one winner; a concurrent
+initializer finishes first and the loser gets `Err(value)`), `get_or_init`
+(exactly one closure runs), `wait` (park until a thread publishes), `take`,
+`into_inner`, plus `Default`, `From<T>`, `Clone`, `PartialEq`/`Eq` and `Debug`.
+The state word and the `MaybeUninit` storage are in `sync/once_lock_core.rs`
+(pure `core`, host-raced); the futex gate that parks concurrent initializers is
+in `sync.rs`. Deviations from std: `try_insert`, `get_or_try_init` and
+`get_mut_or_init` are unstable in std and not provided here, and the
+`RefUnwindSafe`/`UnwindSafe` impls are absent because the target is
+`panic = "abort"`. Reentrant initialization deadlocks, exactly like std.
+
+`rc::Rc`/`rc::Weak` and `sync::Arc`/`sync::Weak` are the `alloc` types
+re-exported at the `std` paths (0.10.0); `Rc` is not `Send`/`Sync` and `Arc` is,
+as in std.
+
+`LazyLock<T, F>` is **single-threaded**, unlike `std::sync::LazyLock`: its
+storage is a `core::cell::OnceCell`, so it is not `Sync` and cannot go in a
+`static` or be shared between the SDK's native threads (the safety argument
+needs `OnceCell`'s `&self` mutation). It also takes an `Fn` initializer rather
+than `FnOnce` so the whole type stays safe. `Default` initializes from
+`T::default()`. For a lazily built value reachable from several threads, use a
+`static OnceLock` + `get_or_init` (or wrap the `LazyLock` in a `Mutex`).
 
 `Condvar` is the std shape: `wait(guard)` releases the mutex, blocks on a
 per-condvar futex sequence word, and re-acquires the mutex before returning;
@@ -908,11 +979,13 @@ Impossible without new kernel syscalls (shown with the SDK's typed
 
 Also deliberately not provided: file locking, `is_terminal` (see
 [`pagh_std::io`](#pagh_stdio): the ABI cannot distinguish the console from a
-socket, and fd 0-2 are not reserved), `OsString`, `Rc`/`Arc` re-exports,
-`OnceLock`, and raw-entry/nightly hash-map APIs. They are userland-only
-conveniences the SDK can grow without a kernel change, except `is_terminal`,
-which needs the kernel to say what a descriptor is. `io::Cursor`, `Read::chain`
-and `Tee` left this list in 0.9.0 and are part of the surface below.
+socket, and fd 0-2 are not reserved), `OsString` (the SDK stores UTF-8 only),
+and raw-entry/nightly hash-map APIs. They are userland-only conveniences the
+SDK can grow without a kernel change, except `is_terminal`, which needs the
+kernel to say what a descriptor is. `io::Cursor`, `Read::chain` and `Tee` left
+this list in 0.9.0; `OnceLock`, `Rc`/`Arc` and `LazyLock` left it in 0.10.0 —
+the thread-safe cell and the reference counters are part of the surface above,
+and `LazyLock` is provided single-threaded, with that deviation documented.
 
 ## Design notes
 
@@ -939,6 +1012,12 @@ and `Tee` left this list in 0.9.0 and are part of the surface below.
   seek/EOF boundary. The only bare-metal type the pure half names is
   `libpagh::errno::Errno`, whose source the gate compiles from the sibling
   checkout.
+- **The same split for synchronization.** `OnceLock`'s state word and storage
+  (`sync/once_lock_core.rs`) are `core`-only, so the CAS protocol is raced with
+  real host threads; the futex parking that its waiters need stays in
+  `sync.rs`. The `alloc` reference counters are pure re-exports, so `Arc` is
+  host-tested across threads as well. The kernel-facing half of the type —
+  park, wake, spurious returns — is live-tested in one guest boot.
 - **Buffering is userland.** `File` is unbuffered on the `read`/`write` path;
   `BufReader`/`BufWriter` add the explicit 8 KiB layer. `File`/`TcpStream` also
   carry an 8 KiB read-ahead buffer for their direct `BufRead` implementation,
@@ -973,6 +1052,7 @@ The transcript covers:
 | DNS | 0.7.0 transcript: `/mnt/etc/resolv.conf` names the DHCP-leased server (the boot log's `dns 10.0.2.3`), a real `A` query with the server's TTLs, `NXDOMAIN`, `InvalidName` before any datagram, a 1 s deadline against a host black hole, and `connect("example.com:80")` → `HTTP/1.1 200 OK` |
 | socket options | 0.7.0 transcript: `SO_TYPE` → `Stream`/`Datagram`, `SO_REUSEADDR` accepted and the second `bind` still refused, non-blocking read `WouldBlock`, 500 ms read deadline and 300 ms UDP deadline enforced by the SDK, `try_clone` echo read back through the clone and the original still usable after it drops |
 | vendored TLS 1.3 | 0.7.0 transcript: a live `https://example.com/` GET through the userland client — chain to the committed bundle (`chain=4 anchors=6`), leaf `sha256:85ca6ab0…`, `CertificateVerify OK`, 577-byte body — and four refusals: `stage=clock`, `stage=entropy`, `cause=chain` (self-signed `openssl s_server`) and `cause=hostname` (a trusted Google chain for `example.com`) |
+| synchronization additions | 0.10.0 transcript: four guest threads racing `OnceLock::get_or_init` with exactly one initializer; a `set` race (1 `Ok`, 3 `Err(value)`); `wait()` parked until set; `take`/`into_inner`/`clone`/reuse; `LazyLock` + `Default`; `Rc`/`Weak` counting; `Arc`/`Weak` across four threads (incl. `Arc<Mutex<u32>>`, `Arc::try_unwrap`) — `SYNC_ONCE_LOCK PASS`, 13/13 checks |
 | userland I/O adapters | 0.9.0 transcript: `Cursor` read/seek/position/BufRead across buffer boundaries in the guest; `Chain` over two cursors, two empty cases and a `File`+cursor pair; `Tee` mirrored 46 bytes to stdout and `/mnt/io_adapters_tee.txt`, read back by `cat` (exactly one copy after a second run) — `IO_ADAPTERS PASS`, 12/12 checks |
 | kernel-backed TLS | 0.8.0 transcript: `tls_get` fetching `https://example.com/` with **no clock and no seed argument** — `tls: verified leaf=sha256:85ca6ab0… chain=4 certs anchors=6 host=example.com`, `tls: CertificateVerify OK`, `tls: user session 0 open host=example.com (TLS 1.3, AES-128-GCM-SHA256, server authenticated, 110 ms)`, `status 200 body 577 bytes` — the same fetch through `TlsStream` (`--manual`), the vendored program seeded from `getrandom`, and two refusals: `cause=chain` and `cause=hostname`, both errno 129 |
 
@@ -986,10 +1066,13 @@ and rewrites `docs/live-sdk-0.7.0.txt` (**55/55 checks**, kernel and ELF
 hashes included). `python3 tools/live_080.py` reproduces the 0.8.0
 kernel-backed TLS matrix and rewrites `docs/live-sdk-0.8.0.txt` (**32/32
 checks**); `python3 tools/live_090.py` reproduces the 0.9.0 I/O-adapter matrix
-and rewrites `docs/live-sdk-0.9.0.txt` (**12/12 checks**). The host unit tests
-are **70 checks** (`cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`):
-the 40 from the earlier pure layers, 28 for the 0.9.0 I/O core, and the two
-`Errno` round-trip tests that arrive with the sibling's `errno.rs` include.
+and rewrites `docs/live-sdk-0.9.0.txt` (**12/12 checks**); `python3
+tools/live_100.py` reproduces the 0.10.0 synchronization matrix and rewrites
+`docs/live-sdk-0.10.0.txt` (**13/13 checks**). The host unit tests are
+**77 checks** (`cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`):
+the 40 from the earlier pure layers, 28 for the 0.9.0 I/O core, 7 for the
+0.10.0 sync core and reference counters, and the two `Errno` round-trip tests
+that arrive with the sibling's `errno.rs` include.
 
 ## CI
 
@@ -1001,12 +1084,12 @@ the 40 from the earlier pure layers, 28 for the 0.9.0 I/O core, and the two
    (package-scoped because `--all` would reformat the sibling `pagh-api`);
 4. runs `./build.sh --fixtures` (all examples and probes);
 5. asserts every example a default build produces — including `tcp_server`,
-   `udp_echo`, `sync_primitives`, `io_adapters` and the kernel-backed
-   `tls_get` — is ≤ 1 MiB;
+   `udp_echo`, `sync_primitives`, `io_adapters`, `sync_once_lock` and the
+   kernel-backed `tls_get` — is ≤ 1 MiB;
 6. builds `--release --vendored` and checks `tls_get_vendored` (plus the release
    sizes of the 0.7.0 examples) against the same limit;
 7. runs `cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`
-   (the pure I/O core, including `Cursor`/`Chain`/`Tee`, is part of that gate);
+   (the pure I/O core and the `OnceLock` state machine are part of that gate);
 8. uploads the example ELFs.
 
 Neither cargo invocation passes `--locked` (steps 4 and 7): the workspace

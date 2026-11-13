@@ -115,7 +115,7 @@ EXAMPLE_DIR="$ROOT/target/$TARGET/$PROFILE_DIR/examples"
 echo
 echo "ELF outputs (kernel image limit: 1 MiB):"
 for name in cat wc find threads_mutex spawn condvar io_traits io_adapters tcp_server udp_echo \
-    sync_primitives hash_map dns socket_opts tls_get; do
+    sync_primitives sync_once_lock hash_map dns socket_opts tls_get; do
     path="$EXAMPLE_DIR/$name"
     if [ ! -f "$path" ]; then
         echo "build.sh: expected $path to exist" >&2
@@ -165,6 +165,7 @@ echo "  run /mnt/io_adapters                   # 0.9.0: Cursor, Read::chain, Tee
 echo "  run /mnt/tcp_server 45679 2                 # with --hostfwd 45679:45679"
 echo "  run /mnt/udp_echo 10.0.2.2 <port> 45680     # with --net and a host echo server"
 echo "  run /mnt/sync_primitives"
+echo "  run /mnt/sync_once_lock                 # 0.10.0: OnceLock, Rc/Arc, LazyLock"
 echo "  run /mnt/tls_get                       # https://example.com/ through the kernel's TLS client"
 echo "  run /mnt/tls_get https://example.com/ --manual"
 echo "  run /mnt/tls_get_vendored https://example.com/ <unix-seconds> kernel   # --vendored build"

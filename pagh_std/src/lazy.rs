@@ -26,13 +26,21 @@ use core::ops::Deref;
 /// # Example
 ///
 /// ```ignore
-/// static TABLE: LazyLock<Vec<u8>> = LazyLock::new(|| vec![1, 2, 3]);
-/// assert_eq!(TABLE.len(), 3);
+/// let table = LazyLock::new(|| vec![1u8, 2, 3]);
+/// assert_eq!(table.len(), 3);
+/// assert!(table.get().is_some());
 /// ```
 ///
-/// `LazyLock` is `Sync` when `T: Sync`/`F: Sync`; in this SDK that only matters
-/// for placing it in a `static`, because no second thread exists to race with
-/// the initializer.
+/// # Deviation from std
+///
+/// `std::sync::LazyLock` is thread-safe and can be placed in a `static`. This
+/// one is **single-threaded**: its storage is a `core::cell::OnceCell`, so the
+/// type is not `Sync` and cannot be put in a `static` or shared between the
+/// SDK's native threads. The safety argument of the whole module depends on
+/// that: `OnceCell::get_or_init` mutates through `&self`. When a lazily built
+/// value has to be reachable from several threads, use a `static
+/// OnceLock` and its `get_or_init`, or wrap a `LazyLock` in the futex-backed
+/// [`Mutex`](crate::sync::Mutex).
 pub struct LazyLock<T, F = fn() -> T> {
     cell: OnceCell<T>,
     init: F,
@@ -84,5 +92,12 @@ impl<T: core::fmt::Debug, F: Fn() -> T> core::fmt::Debug for LazyLock<T, F> {
 impl<T: core::fmt::Display, F: Fn() -> T> core::fmt::Display for LazyLock<T, F> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         core::fmt::Display::fmt(&**self, f)
+    }
+}
+
+impl<T: Default> Default for LazyLock<T> {
+    /// A `LazyLock` that initializes to `T::default()`, like `std`'s.
+    fn default() -> LazyLock<T> {
+        LazyLock::new(T::default)
     }
 }

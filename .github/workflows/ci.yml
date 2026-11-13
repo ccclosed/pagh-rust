@@ -73,12 +73,14 @@ jobs:
         working-directory: pagh-rust
         # Every example that a default build produces, including 0.8.0's
         # kernel-backed `tls_get` (284 KiB debug — it links no TLS stack at all)
-        # and 0.9.0's `io_adapters` (225 KiB; the I/O conveniences are userland
-        # only and link nothing new).
+        # 0.9.0's `io_adapters` (225 KiB; the I/O conveniences are userland
+        # only and link nothing new) and 0.10.0's `sync_once_lock` (210 KiB;
+        # the atomics-based `OnceLock` and reference counters add no syscall).
         run: |
           set -euo pipefail
           for elf in cat wc find threads_mutex spawn condvar io_traits io_adapters \
-                     tcp_server udp_echo sync_primitives hash_map dns socket_opts tls_get; do
+                     tcp_server udp_echo sync_primitives sync_once_lock hash_map dns \
+                     socket_opts tls_get; do
             path="target/riscv64gc-unknown-none-elf/debug/examples/$elf"
             size=$(wc -c <"$path")
             echo "$path: $size bytes"
@@ -123,6 +125,7 @@ jobs:
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/condvar
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/io_traits
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/io_adapters
+            pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/sync_once_lock
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/tcp_server
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/udp_echo
             pagh-rust/target/riscv64gc-unknown-none-elf/debug/examples/sync_primitives

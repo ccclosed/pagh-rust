@@ -19,6 +19,13 @@
 //! is spelled out below because `libpagh::io` also holds the syscall-backed
 //! handles.
 //!
+//! The 0.10.0 sync core follows the same rule. `OnceLock`'s atomic state
+//! machine (`pagh_std/src/sync/once_lock_core.rs`) is syscall-free on purpose:
+//! this gate races it with real host threads, where preemption actually exists,
+//! and only the futex park/unpark half stays target-only. The `alloc` reference
+//! counters the SDK now re-exports (`rc.rs`, `sync/arc.rs`) are pure too, so
+//! `Arc` is also exercised across real host threads here.
+//!
 //! CI runs exactly that. It is not a substitute for the QEMU transcript; it is
 //! the fast loop for component/display/normalization semantics.
 
@@ -73,6 +80,18 @@ mod tls_url;
 // file is `core` + `alloc` only.
 #[path = "../../pagh_std/src/io/pure.rs"]
 mod io_pure;
+
+// The 0.10.0 sync core: `OnceLock`'s state word and storage (pure `core`, so
+// the race protocol is testable here), and the `alloc` reference counters the
+// SDK re-exports at the `std::rc`/`std::sync` paths.
+#[path = "../../pagh_std/src/sync/once_lock_core.rs"]
+mod once_lock_core;
+
+#[path = "../../pagh_std/src/rc.rs"]
+mod rc;
+
+#[path = "../../pagh_std/src/sync/arc.rs"]
+mod arc;
 
 // `pagh_std/src/error.rs` is included too: it is the error type the traits
 // above return. It stores a `libpagh::errno::Errno`, which is why the crate
@@ -1571,5 +1590,209 @@ mod io_090 {
         }
         let mut chain = Cursor::new(b"abc".to_vec()).chain(Cursor::new(b"de".to_vec()));
         assert_eq!(tally(&mut chain).unwrap(), 5);
+    }
+}
+
+/// The 0.10.0 sync additions, driven directly on the host.
+///
+/// `OnceLock` itself cannot be compiled here (its futex park/unpark lives in
+/// `sync.rs` on top of `libpagh`), but its state machine can — and that is
+/// where the interesting invariants are. The race test below runs six real
+/// host threads through the same protocol the guest uses; the QEMU matrix
+/// (`tools/live_100.py`) covers the parking half with the SDK's own threads.
+#[cfg(test)]
+mod sync_100 {
+    use super::once_lock_core::{Begin, Core};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn once_lock_core_walks_the_only_legal_states() {
+        let mut core = Core::new();
+        assert!(!core.is_ready());
+        assert!(core.get().is_none());
+
+        // The first `begin` claims the cell; a second one sees the claim and
+        // must not be told it may initialize.
+        assert!(matches!(core.begin(), Begin::Won));
+        assert!(!core.is_ready());
+        assert!(core.get().is_none());
+        assert!(matches!(core.begin(), Begin::Busy));
+
+        core.publish(41);
+        assert!(core.is_ready());
+        assert_eq!(core.get(), Some(&41));
+        // Once published, every later claim is told the value is there.
+        assert!(matches!(core.begin(), Begin::Ready));
+        assert!(matches!(core.begin(), Begin::Ready));
+        assert_eq!(core.get(), Some(&41));
+
+        // `take` empties the cell and makes it claimable again.
+        assert_eq!(core.take(), Some(41));
+        assert!(!core.is_ready());
+        assert!(core.get().is_none());
+        assert!(core.take().is_none());
+        assert!(matches!(core.begin(), Begin::Won));
+        core.publish(7);
+        assert_eq!(core.get(), Some(&7));
+    }
+
+    #[test]
+    fn once_lock_core_get_mut_and_with_value() {
+        let mut core = Core::with_value(5u32);
+        assert!(core.is_ready());
+        assert_eq!(core.get(), Some(&5));
+        *core.get_mut().expect("initialized") = 6;
+        assert_eq!(core.get(), Some(&6));
+        // A fresh cell has no mutable access either.
+        let mut empty = Core::<u32>::new();
+        assert!(empty.get_mut().is_none());
+    }
+
+    #[test]
+    fn once_lock_core_race_has_exactly_one_initializer() {
+        /// `Core` is an `UnsafeCell` and therefore not `Sync`; the test shares
+        /// it the way `OnceLock` does, so the wrapper carries the unsafety.
+        struct Shared {
+            core: Core<u32>,
+            initializers: AtomicU32,
+        }
+
+        // SAFETY: the threads below only use the protocol `Core` documents —
+        // `begin` (a CAS), `publish` by the single `Begin::Won` thread, and
+        // `is_ready`/`get` (Acquire) after a Release publication. No thread
+        // calls a `&mut self` method while another holds a reference.
+        unsafe impl Sync for Shared {}
+
+        let shared = Shared {
+            core: Core::new(),
+            initializers: AtomicU32::new(0),
+        };
+        let observed = AtomicU32::new(0);
+
+        std::thread::scope(|scope| {
+            for candidate in 0..6u32 {
+                let shared = &shared;
+                let observed = &observed;
+                scope.spawn(move || loop {
+                    match shared.core.begin() {
+                        Begin::Won => {
+                            shared.initializers.fetch_add(1, Ordering::SeqCst);
+                            shared.core.publish(candidate * 3);
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        Begin::Busy => {
+                            // Host threads are preempted, so a bounded spin is
+                            // not a livelock; the guest version parks instead.
+                            while !shared.core.is_ready() {
+                                core::hint::spin_loop();
+                            }
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        Begin::Ready => {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            shared.initializers.load(Ordering::SeqCst),
+            1,
+            "more than one thread initialized the cell"
+        );
+        assert_eq!(observed.load(Ordering::SeqCst), 6);
+        let value = shared.core.get().expect("one thread published a value");
+        assert!(
+            [0u32, 3, 6, 9, 12, 15].contains(value),
+            "unexpected {value}"
+        );
+    }
+
+    #[test]
+    fn once_lock_core_drops_the_value_exactly_once() {
+        static DROPS: AtomicU32 = AtomicU32::new(0);
+
+        struct Noisy(u32);
+        impl Drop for Noisy {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut core = Core::new();
+        assert!(matches!(core.begin(), Begin::Won));
+        core.publish(Noisy(9));
+        assert_eq!(core.get().map(|noisy| noisy.0), Some(9));
+        core.drop_value();
+        assert!(core.get().is_none());
+        // Dropping the cell afterwards must not drop the value a second time.
+        drop(core);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+
+        // An empty cell's `drop_value` drops nothing.
+        let mut empty = Core::<Noisy>::new();
+        empty.drop_value();
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rc_is_the_alloc_rc_at_the_std_path() {
+        use super::rc::{Rc, Weak};
+        let rc = Rc::new(41u32);
+        assert_eq!(Rc::strong_count(&rc), 1);
+        let clone = Rc::clone(&rc);
+        assert_eq!(Rc::strong_count(&rc), 2);
+        assert!(Rc::ptr_eq(&rc, &clone));
+        let weak: Weak<u32> = Rc::downgrade(&rc);
+        drop(clone);
+        assert_eq!(Rc::strong_count(&rc), 1);
+        assert_eq!(weak.upgrade().map(|value| *value), Some(41));
+        drop(rc);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(Rc::try_unwrap(Rc::new(7u32)), Ok(7));
+    }
+
+    #[test]
+    fn arc_is_the_alloc_arc_and_crosses_host_threads() {
+        use super::arc::{Arc, Weak};
+        use core::sync::atomic::AtomicU32;
+
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Arc<AtomicU32>>();
+
+        let counter = Arc::new(AtomicU32::new(0));
+        assert_eq!(Arc::strong_count(&counter), 1);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let counter = Arc::clone(&counter);
+                scope.spawn(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(counter.load(Ordering::SeqCst), 8);
+        assert_eq!(Arc::strong_count(&counter), 1);
+
+        let weak: Weak<AtomicU32> = Arc::downgrade(&counter);
+        assert!(weak.upgrade().is_some());
+        let unique = Arc::try_unwrap(counter).expect("the threads have joined");
+        assert_eq!(unique.load(Ordering::SeqCst), 8);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn lazy_lock_default_matches_std() {
+        use super::lazy::LazyLock;
+        let number: LazyLock<u32> = LazyLock::default();
+        assert_eq!(*number, 0);
+        assert!(number.get().is_some());
+        let text: LazyLock<alloc::string::String> = Default::default();
+        assert!(text.is_empty());
+        // The initializer runs once, and `force` returns the cached value.
+        assert_eq!(LazyLock::force(&text).len(), 0);
     }
 }
