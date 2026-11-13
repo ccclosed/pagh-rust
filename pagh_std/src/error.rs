@@ -11,7 +11,7 @@
 
 use core::fmt;
 
-use libpagh::errno::Errno;
+use crate::Errno;
 
 /// The error class, modeled on `std::io::ErrorKind`.
 ///

@@ -10,6 +10,15 @@
 //! cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu
 //! ```
 //!
+//! The 0.9.0 I/O conveniences (`io::Cursor`, `Read::chain`, `Tee`) live in
+//! `pagh_std/src/io/pure.rs` for the same reason: `io.rs` owns the console
+//! handles and `poll` and needs `libpagh`, the pure half needs only `core` +
+//! `alloc`. Two `libpagh` items are still named there, and both are pure: its
+//! frozen `errno` table (included from the sibling checkout's own source, so
+//! this gate sees the numbers the SDK is built against) and `SeekFrom`, which
+//! is spelled out below because `libpagh::io` also holds the syscall-backed
+//! handles.
+//!
 //! CI runs exactly that. It is not a substitute for the QEMU transcript; it is
 //! the fast loop for component/display/normalization semantics.
 
@@ -58,6 +67,55 @@ mod http;
 // must be tested against adversarial input rather than only against a live URL.
 #[path = "../../pagh_std/src/tls/url.rs"]
 mod tls_url;
+
+// The kernel-independent I/O core (0.9.0): `Read`/`Write`/`Seek`/`BufRead`,
+// the buffered adapters, `Cursor`, `Read::chain` and `Tee`. Everything in that
+// file is `core` + `alloc` only.
+#[path = "../../pagh_std/src/io/pure.rs"]
+mod io_pure;
+
+// `pagh_std/src/error.rs` is included too: it is the error type the traits
+// above return. It stores a `libpagh::errno::Errno`, which is why the crate
+// root re-exports the frozen table below.
+#[path = "../../pagh_std/src/error.rs"]
+mod error;
+
+// `libpagh` cannot be a host dependency: its crate root is `#![no_std]` with a
+// RISC-V `ecall` syscall module. The two items the pure sources name from it
+// are pure, though, so the gate supplies exactly those:
+//
+//   * `errno` is the sibling checkout's own `errno.rs`, compiled from source.
+//     The numbers and messages are therefore the ones the SDK is built
+//     against, not a copy in this crate that can drift. It also brings that
+//     file's own round-trip test into this suite, which is the point: the
+//     table is the ABI.
+//   * `io::SeekFrom` is std's three-variant enum. `libpagh::io` cannot be
+//     included as a whole because the same file defines `Stdin`/`Stdout`/
+//     `Stderr` over the syscalls, so this one pure type is repeated below.
+//     `pagh_std::io::SeekFrom` is `libpagh::io::SeekFrom` on the target.
+#[path = "../../../pagh-api/libpagh/src/errno.rs"]
+pub(crate) mod libpagh_errno;
+pub(crate) use libpagh_errno::Errno;
+
+/// Host stand-in for the `libpagh::io` module: only `SeekFrom` is pure.
+mod libpagh_io {
+    /// Origin of a [`Seek`](super::io_pure::Seek) call, std-shaped.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SeekFrom {
+        /// Offset from the start of the stream, in bytes.
+        Start(u64),
+        /// Offset from the end of the stream, in bytes (usually negative).
+        End(i64),
+        /// Offset from the current position, in bytes.
+        Current(i64),
+    }
+}
+
+/// The `io` path `pagh_std/src/io/pure.rs` names for `SeekFrom`, so the file
+/// compiles here unchanged.
+mod io {
+    pub use crate::libpagh_io::SeekFrom;
+}
 
 #[cfg(test)]
 mod tests {
@@ -812,5 +870,706 @@ mod pure_080 {
         ] {
             assert_eq!(Target::parse(url).unwrap().host_port(), expected);
         }
+    }
+}
+
+/// The 0.9.0 I/O conveniences, driven directly on the host: every seek and EOF
+/// boundary of `Cursor`, both readers of `Chain` (including the empty cases and
+/// the "empty buffer is not EOF" rule), the `BufRead` hand-off between them, and
+/// `Tee`'s mirroring (short writes, a lying writer, flush order).
+///
+/// What the live run cannot do cheaply is enumerate the boundaries; that is what
+/// this module is for. The live matrix (`tools/live_090.py`) proves the same
+/// code compiles and runs on the kernel.
+#[cfg(test)]
+mod io_090 {
+    use super::error::{ErrorKind, Result};
+    use super::io_pure::{
+        copy, read_to_end, BufRead, BufReader, BufWriter, Chain, Cursor, Read, Seek, Tee, Write,
+    };
+    use super::libpagh_io::SeekFrom;
+
+    /// A writer that records every accepted byte, for the `Tee` tests.
+    #[derive(Debug, Default)]
+    struct Capture {
+        bytes: alloc::vec::Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cursor_reads_across_every_buffer_boundary() {
+        let mut cursor = Cursor::new(b"abcdefghij".to_vec());
+        assert_eq!(cursor.position(), 0);
+        assert_eq!(cursor.get_ref().as_slice(), b"abcdefghij");
+
+        let mut first = [0u8; 3];
+        assert_eq!(cursor.read(&mut first).unwrap(), 3);
+        assert_eq!(&first, b"abc");
+        assert_eq!(cursor.position(), 3);
+
+        // A short read is not EOF: a four-byte request continues at the exact
+        // byte the previous one stopped at.
+        let mut second = [0u8; 4];
+        assert_eq!(cursor.read(&mut second).unwrap(), 4);
+        assert_eq!(&second, b"defg");
+        assert_eq!(cursor.position(), 7);
+
+        // An empty destination must not move the cursor (and must not be
+        // mistaken for EOF by anything downstream).
+        assert_eq!(cursor.read(&mut []).unwrap(), 0);
+        assert_eq!(cursor.position(), 7);
+
+        let mut rest = alloc::vec::Vec::new();
+        assert_eq!(cursor.read_to_end(&mut rest).unwrap(), 3);
+        assert_eq!(rest, b"hij");
+        assert_eq!(cursor.position(), 10);
+
+        // Past the end: zero bytes, position unchanged.
+        assert_eq!(cursor.read(&mut second).unwrap(), 0);
+        assert_eq!(cursor.position(), 10);
+        assert_eq!(cursor.fill_buf().unwrap(), b"");
+        assert_eq!(cursor.into_inner(), b"abcdefghij".to_vec());
+    }
+
+    #[test]
+    fn cursor_read_to_end_appends_and_reads_a_borrowed_slice() {
+        let mut cursor = Cursor::new(b"world".to_vec());
+        let mut out = b"hello ".to_vec();
+        assert_eq!(cursor.read_to_end(&mut out).unwrap(), 5);
+        assert_eq!(out, b"hello world");
+        assert_eq!(read_to_end(&mut cursor).unwrap().len(), 0);
+        assert_eq!(cursor.position(), 5);
+
+        // `T: AsRef<[u8]>`, not just `Vec<u8>`: a borrowed slice and a `&str`
+        // work with the same type.
+        let mut borrowed = Cursor::new(&b"boxed"[..]);
+        let mut text = alloc::string::String::new();
+        assert_eq!(borrowed.read_to_string(&mut text).unwrap(), 5);
+        assert_eq!(text, "boxed");
+
+        let mut utf8 = Cursor::new("héllo");
+        assert_eq!(
+            read_to_end(&mut utf8).unwrap().as_slice(),
+            "héllo".as_bytes()
+        );
+    }
+
+    #[test]
+    fn cursor_seek_start_current_end_and_position() {
+        let mut cursor = Cursor::new(b"0123456789".to_vec());
+        assert_eq!(cursor.seek(SeekFrom::Start(4)).unwrap(), 4);
+        assert_eq!(cursor.position(), 4);
+        assert_eq!(cursor.seek(SeekFrom::Current(-2)).unwrap(), 2);
+        assert_eq!(cursor.seek(SeekFrom::End(-3)).unwrap(), 7);
+        assert_eq!(cursor.seek(SeekFrom::End(0)).unwrap(), 10);
+        assert_eq!(cursor.stream_position().unwrap(), 10);
+
+        // `set_position` is the same thing without the return value, and
+        // `rewind`/`seek_relative` are the trait's defaults over `seek`.
+        cursor.set_position(1);
+        assert_eq!(cursor.position(), 1);
+        cursor.rewind().unwrap();
+        assert_eq!(cursor.position(), 0);
+        cursor.seek_relative(5).unwrap();
+        assert_eq!(cursor.position(), 5);
+        let mut byte = [0u8; 1];
+        cursor.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [b'5']);
+        assert_eq!(cursor.position(), 6);
+    }
+
+    #[test]
+    fn cursor_seeking_past_the_end_stays_readable() {
+        // std permits this: the position is kept, the window is empty, and a
+        // later seek back recovers the data.
+        let mut cursor = Cursor::new(b"abc".to_vec());
+        assert_eq!(cursor.seek(SeekFrom::Start(100)).unwrap(), 100);
+        assert_eq!(cursor.position(), 100);
+        assert_eq!(cursor.read(&mut [0u8; 4]).unwrap(), 0);
+        assert_eq!(cursor.fill_buf().unwrap(), b"");
+        cursor.set_position(1);
+        assert_eq!(cursor.fill_buf().unwrap(), b"bc");
+        assert_eq!(cursor.seek(SeekFrom::Current(0)).unwrap(), 1);
+        // `Start` is returned unchecked, like std, and an empty read of the
+        // empty window is still an empty read.
+        assert_eq!(cursor.seek(SeekFrom::Start(u64::MAX)).unwrap(), u64::MAX);
+        assert_eq!(cursor.read(&mut [0u8; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn cursor_negative_or_overflowing_seeks_are_typed_errors() {
+        let mut cursor = Cursor::new(b"abc".to_vec());
+        for pos in [
+            SeekFrom::Current(-1),
+            SeekFrom::End(-4),
+            SeekFrom::End(i64::MIN),
+        ] {
+            let error = cursor.seek(pos).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        }
+        // A failed seek leaves the position where it was.
+        assert_eq!(cursor.position(), 0);
+        // The largest in-range end-relative seek lands on the same value.
+        assert_eq!(
+            cursor.seek(SeekFrom::End(i64::MAX)).unwrap(),
+            3 + i64::MAX as u64
+        );
+    }
+
+    #[test]
+    fn cursor_bufread_fill_consume_and_read_until() {
+        let mut cursor = Cursor::new(b"line one\nline two\n".to_vec());
+        assert_eq!(cursor.fill_buf().unwrap(), &b"line one\nline two\n"[..]);
+        cursor.consume(4);
+        assert_eq!(cursor.position(), 4);
+        assert_eq!(cursor.fill_buf().unwrap(), &b" one\nline two\n"[..]);
+
+        // Reading through the same cursor continues inside the window.
+        let mut head = [0u8; 5];
+        cursor.read_exact(&mut head).unwrap();
+        assert_eq!(&head, b" one\n");
+        assert_eq!(cursor.position(), 9);
+
+        // `read_until`/`read_line` are the trait's default methods over
+        // `fill_buf` + `consume`.
+        let mut line = alloc::vec::Vec::new();
+        assert_eq!(cursor.read_until(b'\n', &mut line).unwrap(), 9);
+        assert_eq!(line, b"line two\n");
+        let mut tail = alloc::vec::Vec::new();
+        assert_eq!(cursor.read_until(b'\n', &mut tail).unwrap(), 0);
+        assert!(tail.is_empty());
+
+        // A consume past the end is clamped by the saturating position: the
+        // window is empty and no byte is invented.
+        cursor.consume(usize::MAX);
+        assert_eq!(cursor.fill_buf().unwrap(), b"");
+        assert_eq!(cursor.read(&mut [0u8; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn cursor_lines_decode_utf8() {
+        let mut cursor = Cursor::new("привет\nworld\r\n".as_bytes().to_vec());
+        let mut line = alloc::string::String::new();
+        assert_eq!(cursor.read_line(&mut line).unwrap(), "привет\n".len());
+        assert_eq!(line, "привет\n");
+        let mut line = alloc::string::String::new();
+        assert_eq!(cursor.read_line(&mut line).unwrap(), "world\r\n".len());
+        assert_eq!(line, "world\r\n");
+
+        let cursor = Cursor::new(b"a\nb\r\nc".to_vec());
+        let lines: alloc::vec::Vec<alloc::string::String> = cursor
+            .lines()
+            .map(|line| line.expect("valid UTF-8 from the fixed input"))
+            .collect();
+        assert_eq!(lines, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn cursor_early_eof_and_invalid_utf8_are_typed() {
+        let mut cursor = Cursor::new(b"abc".to_vec());
+        let mut too_big = [0u8; 4];
+        let error = cursor.read_exact(&mut too_big).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+
+        // `read_to_string` validates before it appends: a non-UTF-8 tail leaves
+        // the destination untouched.
+        let mut invalid = Cursor::new(alloc::vec![0xffu8, 0xfe]);
+        let mut text = alloc::string::String::new();
+        let error = invalid.read_to_string(&mut text).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(text.is_empty());
+
+        // And a valid prefix followed by an invalid byte is still an error for
+        // the whole read, not a truncated string.
+        let mut mixed = Cursor::new(b"ok\xff".to_vec());
+        let mut text = alloc::string::String::new();
+        assert_eq!(
+            mixed.read_to_string(&mut text).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn cursor_composes_with_take_and_copy() {
+        let mut limited = Cursor::new(b"abcdef".to_vec()).take(3);
+        let mut out = alloc::vec::Vec::new();
+        assert_eq!(limited.read_to_end(&mut out).unwrap(), 3);
+        assert_eq!(out, b"abc");
+
+        let mut source = Cursor::new(b"copy me".to_vec());
+        let mut sink = Capture::default();
+        assert_eq!(copy(&mut source, &mut sink).unwrap(), 7);
+        assert_eq!(sink.bytes, b"copy me");
+    }
+
+    #[test]
+    fn chain_reads_first_then_second() {
+        let mut chain = Cursor::new(b"abc".to_vec()).chain(Cursor::new(b"def".to_vec()));
+        let mut out = alloc::vec::Vec::new();
+        assert_eq!(chain.read_to_end(&mut out).unwrap(), 6);
+        assert_eq!(out, b"abcdef");
+
+        // Neither reader is drained early: the first read stops inside `first`.
+        let mut chain = Cursor::new(b"abc".to_vec()).chain(Cursor::new(b"def".to_vec()));
+        let mut one = [0u8; 1];
+        assert_eq!(chain.read(&mut one).unwrap(), 1);
+        assert_eq!(one, [b'a']);
+        assert_eq!(chain.get_ref().1.position(), 0);
+        assert_eq!(chain.get_ref().0.position(), 1);
+    }
+
+    #[test]
+    fn chain_over_empty_readers_collapses_to_the_other_side() {
+        // Empty first, full second: the transition happens on the first read.
+        let mut chain = Cursor::new(alloc::vec::Vec::<u8>::new()).chain(Cursor::new(b"xyz"));
+        let mut out = alloc::vec::Vec::new();
+        assert_eq!(chain.read_to_end(&mut out).unwrap(), 3);
+        assert_eq!(out, b"xyz");
+
+        // Full first, empty second.
+        let mut chain = Cursor::new(b"abc".to_vec()).chain(Cursor::new(&b""[..]));
+        assert_eq!(read_to_end(&mut chain).unwrap(), b"abc");
+
+        // Both empty.
+        let mut chain = Cursor::new(&b""[..]).chain(Cursor::new(&b""[..]));
+        assert_eq!(read_to_end(&mut chain).unwrap(), b"");
+
+        // Empty `&[u8]` readers chain like any other `Read`.
+        let mut chain = (&b""[..]).chain(&b"hi"[..]);
+        assert_eq!(read_to_end(&mut chain).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn chain_reads_exactly_across_the_boundary_and_reports_early_eof() {
+        // Four bytes total, asked for four: the last byte comes from `second`.
+        let mut chain = Cursor::new(b"ab".to_vec()).chain(Cursor::new(b"cd".to_vec()));
+        let mut exact = [0u8; 4];
+        chain.read_exact(&mut exact).unwrap();
+        assert_eq!(&exact, b"abcd");
+
+        // Four bytes total, asked for five: the failure is `UnexpectedEof`, not
+        // a short read that looks like success.
+        let mut chain = Cursor::new(b"ab".to_vec()).chain(Cursor::new(b"cd".to_vec()));
+        let mut too_big = [0u8; 5];
+        let error = chain.read_exact(&mut too_big).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn chain_an_empty_buffer_is_not_end_of_file() {
+        // std's rule: `read(&mut [])` returns 0 and must not advance the chain
+        // to its second reader, or a caller doing an empty read would silently
+        // skip `first`.
+        let mut chain = Cursor::new(b"ab".to_vec()).chain(Cursor::new(b"cd".to_vec()));
+        assert_eq!(chain.read(&mut []).unwrap(), 0);
+        let mut one = [0u8; 1];
+        assert_eq!(chain.read(&mut one).unwrap(), 1);
+        assert_eq!(one, [b'a']);
+        assert_eq!(chain.get_ref().0.position(), 1);
+        assert_eq!(chain.get_ref().1.position(), 0);
+    }
+
+    #[test]
+    fn chain_bufread_hands_out_the_current_reader() {
+        // Both halves are buffered, so the chain is too. `fill_buf` serves the
+        // current reader's window and `consume` marks bytes of that one; the
+        // hand-off happens exactly when the first window comes back empty.
+        let mut chain = Cursor::new(b"ab".to_vec()).chain(Cursor::new(b"cd".to_vec()));
+        assert_eq!(chain.fill_buf().unwrap(), &b"ab"[..]);
+        chain.consume(1);
+        assert_eq!(chain.fill_buf().unwrap(), &b"b"[..]);
+        chain.consume(1);
+        assert_eq!(chain.fill_buf().unwrap(), &b"cd"[..]);
+        chain.consume(1);
+        assert_eq!(chain.fill_buf().unwrap(), &b"d"[..]);
+        chain.consume(1);
+        assert_eq!(chain.fill_buf().unwrap(), b"");
+        assert_eq!(chain.fill_buf().unwrap(), b"");
+
+        // `read_until` (the trait default over `fill_buf`/`consume`) finds a
+        // delimiter in the second reader.
+        let mut chain = Cursor::new(b"ab".to_vec()).chain(Cursor::new(b"cd\n"));
+        let mut line = alloc::vec::Vec::new();
+        assert_eq!(chain.read_until(b'\n', &mut line).unwrap(), 5);
+        assert_eq!(line, b"abcd\n");
+
+        // A chain of an empty first reader still answers the second's window.
+        let mut chain = Cursor::new(alloc::vec::Vec::<u8>::new()).chain(Cursor::new(b"z"));
+        assert_eq!(chain.fill_buf().unwrap(), &b"z"[..]);
+    }
+
+    #[test]
+    fn chain_accessors_expose_both_readers() {
+        let mut chain = Cursor::new(b"a".to_vec()).chain(Cursor::new(b"b".to_vec()));
+        assert_eq!(chain.get_ref().0.position(), 0);
+        assert_eq!(chain.get_mut().1.get_ref().as_slice(), b"b");
+        let (mut first, mut second) = chain.into_inner();
+        assert_eq!(read_to_end(&mut first).unwrap(), b"a");
+        assert_eq!(read_to_end(&mut second).unwrap(), b"b");
+    }
+
+    #[test]
+    fn chain_of_borrowed_slices_is_a_reader() {
+        fn assert_read<R: Read>() {}
+        fn assert_bufread<B: BufRead>() {}
+        assert_read::<Chain<Cursor<alloc::vec::Vec<u8>>, &'static [u8]>>();
+        assert_bufread::<Chain<Cursor<alloc::vec::Vec<u8>>, Cursor<&'static [u8]>>>();
+
+        let mut chain = (&b"one "[..]).chain(&b"two"[..]);
+        let mut out = alloc::vec::Vec::new();
+        assert_eq!(chain.read_to_end(&mut out).unwrap(), 7);
+        assert_eq!(out, b"one two");
+    }
+
+    #[test]
+    fn tee_writes_the_same_bytes_to_both_sinks() {
+        let mut tee = Tee::new(Capture::default(), Capture::default());
+        tee.write_all(b"hello ").unwrap();
+        assert_eq!(tee.write(b"world").unwrap(), 5);
+        tee.flush().unwrap();
+        let (writer, file) = tee.into_inner();
+        assert_eq!(writer.bytes, b"hello world");
+        assert_eq!(file.bytes, b"hello world");
+        assert_eq!(writer.flushes, 1);
+        assert_eq!(file.flushes, 1);
+    }
+
+    /// A writer that accepts at most `chunk` bytes per call.
+    #[derive(Debug)]
+    struct Trickle {
+        bytes: alloc::vec::Vec<u8>,
+        chunk: usize,
+    }
+
+    impl Write for Trickle {
+        fn write(&mut self, buf: &[u8]) -> Result<usize> {
+            let n = core::cmp::min(self.chunk, buf.len());
+            self.bytes.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tee_mirrors_only_the_bytes_the_writer_accepted() {
+        // The first sink is short-writing, so `write_all` calls `Tee::write`
+        // repeatedly; the second sink must still receive every byte exactly
+        // once, in order — that is the whole point of `write_all` inside.
+        let trickle = Trickle {
+            bytes: alloc::vec::Vec::new(),
+            chunk: 1,
+        };
+        let mut tee = Tee::new(trickle, Capture::default());
+        tee.write_all(b"abcdef").unwrap();
+        let (writer, file) = tee.into_inner();
+        assert_eq!(writer.bytes, b"abcdef");
+        assert_eq!(file.bytes, b"abcdef");
+        // A single short write is reported as such (the `Write` contract).
+        let trickle = Trickle {
+            bytes: alloc::vec::Vec::new(),
+            chunk: 2,
+        };
+        let mut tee = Tee::new(trickle, Capture::default());
+        assert_eq!(tee.write(b"xyz").unwrap(), 2);
+        let (writer, file) = tee.into_inner();
+        assert_eq!(writer.bytes, b"xy");
+        assert_eq!(file.bytes, b"xy");
+    }
+
+    #[test]
+    fn tee_refuses_a_writer_that_lies_about_its_count() {
+        struct Liar;
+        impl Write for Liar {
+            fn write(&mut self, buf: &[u8]) -> Result<usize> {
+                Ok(buf.len() + 1)
+            }
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut tee = Tee::new(Liar, Capture::default());
+        let error = tee.write(b"ab").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        // Nothing reached the second sink: the error is found before the copy.
+        assert!(tee.into_inner().1.bytes.is_empty());
+    }
+
+    #[test]
+    fn tee_flushes_the_writer_before_the_file() {
+        #[derive(Debug)]
+        struct Logged<'a> {
+            label: &'static str,
+            events: &'a core::cell::RefCell<alloc::vec::Vec<&'static str>>,
+        }
+        impl Write for Logged<'_> {
+            fn write(&mut self, buf: &[u8]) -> Result<usize> {
+                self.events.borrow_mut().push(self.label);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> Result<()> {
+                self.events.borrow_mut().push(if self.label == "writer" {
+                    "flush writer"
+                } else {
+                    "flush file"
+                });
+                Ok(())
+            }
+        }
+        let events = core::cell::RefCell::new(alloc::vec::Vec::new());
+        let mut tee = Tee::new(
+            Logged {
+                label: "writer",
+                events: &events,
+            },
+            Logged {
+                label: "file",
+                events: &events,
+            },
+        );
+        tee.write_all(b"x").unwrap();
+        tee.flush().unwrap();
+        assert_eq!(
+            *events.borrow(),
+            ["writer", "file", "flush writer", "flush file"]
+        );
+    }
+
+    #[test]
+    fn bufreader_over_a_cursor_matches_direct_reads() {
+        // A cursor underneath a `BufReader`: the buffer refills from the
+        // cursor, and `BufReader::seek(Current(0))` has to subtract the unread
+        // bytes it is holding — the accounting this adapter exists for.
+        let payload = b"0123456789";
+        let mut reader = BufReader::with_capacity(7, Cursor::new(payload.to_vec()));
+        let mut seen = [0u8; 3];
+        reader.read_exact(&mut seen).unwrap();
+        assert_eq!(&seen, b"012");
+        // Seven bytes were read ahead from the cursor, three of them consumed.
+        assert_eq!(reader.buffer(), &b"3456"[..]);
+        assert_eq!(reader.fill_buf().unwrap(), &b"3456"[..]);
+        reader.consume(2);
+        assert_eq!(reader.fill_buf().unwrap(), &b"56"[..]);
+        // The cursor is seven bytes ahead of the logical position, so rewinding
+        // to the logical position subtracts the seven unread buffered bytes.
+        assert_eq!(reader.seek(SeekFrom::Current(0)).unwrap(), 5);
+        let mut rest = alloc::vec::Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"56789");
+        assert_eq!(reader.into_inner().into_inner(), payload.to_vec());
+    }
+
+    #[test]
+    fn cursor_default_and_get_mut_can_move_the_end() {
+        // `Default` is std's: an empty byte source at position 0.
+        let mut empty = Cursor::<alloc::vec::Vec<u8>>::default();
+        assert_eq!(empty.position(), 0);
+        assert_eq!(empty.fill_buf().unwrap(), b"");
+        assert_eq!(empty.read(&mut [0u8; 1]).unwrap(), 0);
+
+        // `get_mut` exposes the buffer; growing it moves the end of file, so a
+        // read started before the mutation sees the new bytes (std's behaviour
+        // for a `Cursor` over an owning container).
+        let mut cursor = Cursor::new(b"ab".to_vec());
+        cursor.get_mut().extend_from_slice(b"cd");
+        let mut all = alloc::vec::Vec::new();
+        assert_eq!(cursor.read_to_end(&mut all).unwrap(), 4);
+        assert_eq!(all, b"abcd");
+    }
+
+    #[test]
+    fn cursor_read_to_string_crosses_the_default_chunk_boundary() {
+        // `read_to_end`/`read_to_string` copy in 4096-byte chunks; a cursor has
+        // to serve the tail correctly when the payload is not a multiple of
+        // that, and `read_to_string` has to validate the whole run.
+        let text = "é".repeat(3000); // 6000 UTF-8 bytes, one byte pair per char
+        let mut cursor = Cursor::new(text.as_bytes().to_vec());
+        let mut out = alloc::string::String::new();
+        assert_eq!(cursor.read_to_string(&mut out).unwrap(), text.len());
+        assert_eq!(out, text);
+        assert_eq!(cursor.position(), text.len() as u64);
+        // A second read at EOF appends nothing and reports 0.
+        assert_eq!(cursor.read_to_string(&mut out).unwrap(), 0);
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn chain_reads_only_the_second_reader_once_the_first_is_finished() {
+        let mut chain = Cursor::new(b"ab".to_vec()).chain(Cursor::new(b"cdef".to_vec()));
+        let mut exactly = [0u8; 3];
+        chain.read_exact(&mut exactly).unwrap();
+        assert_eq!(&exactly, b"abc");
+        // The transition was consumed inside that `read_exact`; the first
+        // reader is now at its end and the chain serves `second` only.
+        assert_eq!(chain.read(&mut [0u8; 0]).unwrap(), 0);
+        let mut rest = alloc::vec::Vec::new();
+        assert_eq!(chain.read_to_end(&mut rest).unwrap(), 3);
+        assert_eq!(rest, b"def");
+        assert_eq!(chain.get_ref().1.position(), 4);
+    }
+
+    #[test]
+    fn chain_composes_with_take_and_bufreader() {
+        // `Take<Chain<..>>`: the limit is applied after the concatenation.
+        let mut limited = Cursor::new(b"hello ".to_vec())
+            .chain(Cursor::new(b"world".to_vec()))
+            .take(8);
+        let mut out = alloc::vec::Vec::new();
+        assert_eq!(limited.read_to_end(&mut out).unwrap(), 8);
+        assert_eq!(out, b"hello wo");
+
+        // `BufReader<Chain<..>>`: the buffer is refilled across the hand-off.
+        let mut reader = BufReader::with_capacity(
+            2,
+            Cursor::new(b"ab".to_vec()).chain(Cursor::new(b"cd".to_vec())),
+        );
+        assert_eq!(reader.fill_buf().unwrap(), &b"ab"[..]);
+        let mut all = alloc::vec::Vec::new();
+        reader.read_to_end(&mut all).unwrap();
+        assert_eq!(all, b"abcd");
+    }
+
+    #[test]
+    fn tee_works_with_buffered_sinks_and_flushes_both() {
+        // Both sinks are `BufWriter`s, so the bytes only reach the captures on
+        // `flush`; `Tee::flush` has to flush the writer first and the file
+        // second, and `into_inner` then hands both back in order.
+        let mut tee = Tee::new(
+            BufWriter::with_capacity(32, Capture::default()),
+            BufWriter::with_capacity(32, Capture::default()),
+        );
+        tee.write_all(b"buffered").unwrap();
+        assert_eq!(tee.get_ref().0.buffer(), b"buffered");
+        tee.flush().unwrap();
+        let (writer, file) = tee.into_inner();
+        let writer = writer.into_inner().expect("writer flush");
+        let file = file.into_inner().expect("file flush");
+        assert_eq!(writer.bytes, b"buffered");
+        assert_eq!(file.bytes, b"buffered");
+        // One flush each from `Tee::flush`; `BufWriter::into_inner` flushes
+        // again on its way out, which is why the count is two, not one.
+        assert_eq!((writer.flushes, file.flushes), (2, 2));
+    }
+
+    #[test]
+    fn cursor_matches_a_reference_model_over_random_operations() {
+        // A deterministic sequence of reads, seeks and consumes against a
+        // slice-plus-position model of std's Cursor. The hand-written tests
+        // above pin the interesting boundaries; this one is free to wander
+        // across them and catch an off-by-one the enumerated cases missed.
+        fn next(state: &mut u64) -> u64 {
+            // xorshift64*: deterministic, no dependency, good enough to shuffle
+            // the operation order.
+            let mut x = *state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            *state = x;
+            x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        let data: alloc::vec::Vec<u8> = (0..37u8).map(|value| value.wrapping_mul(7)).collect();
+        let mut cursor = Cursor::new(data.clone());
+        let mut position: u64 = 0;
+        let mut state = 0x5eed_1234_abcd_9876u64;
+
+        for step in 0..4000 {
+            let choice = next(&mut state) % 6;
+            match choice {
+                0 | 1 => {
+                    // Read into a variable-size buffer.
+                    let mut buffer = [0u8; 8];
+                    let length = (next(&mut state) % 9) as usize;
+                    let read = cursor.read(&mut buffer[..length]).unwrap();
+                    let start = core::cmp::min(position as usize, data.len());
+                    let expected = core::cmp::min(length, data.len() - start);
+                    assert_eq!(read, expected, "read length at step {step}");
+                    assert_eq!(&buffer[..read], &data[start..start + expected]);
+                    position += expected as u64;
+                }
+                2 => {
+                    // Peek through BufRead and consume a random count.
+                    {
+                        let window = cursor.fill_buf().unwrap();
+                        let start = core::cmp::min(position as usize, data.len());
+                        assert_eq!(window, &data[start..], "fill_buf at step {step}");
+                    }
+                    let amount = (next(&mut state) % 12) as usize;
+                    cursor.consume(amount);
+                    position = position.saturating_add(amount as u64);
+                }
+                3 => {
+                    let target = next(&mut state) % 37;
+                    assert_eq!(cursor.seek(SeekFrom::Start(target)).unwrap(), target);
+                    position = target;
+                }
+                4 => {
+                    let delta = (next(&mut state) % 41) as i64 - 20;
+                    let expected = position as i128 + delta as i128;
+                    if expected < 0 {
+                        assert_eq!(
+                            cursor.seek(SeekFrom::Current(delta)).unwrap_err().kind(),
+                            ErrorKind::InvalidInput,
+                            "negative relative seek at step {step}"
+                        );
+                    } else {
+                        assert_eq!(
+                            cursor.seek(SeekFrom::Current(delta)).unwrap(),
+                            expected as u64
+                        );
+                        position = expected as u64;
+                    }
+                }
+                _ => {
+                    let delta = (next(&mut state) % 41) as i64 - 20;
+                    let expected = data.len() as i128 + delta as i128;
+                    if expected < 0 {
+                        assert_eq!(
+                            cursor.seek(SeekFrom::End(delta)).unwrap_err().kind(),
+                            ErrorKind::InvalidInput,
+                            "negative end seek at step {step}"
+                        );
+                    } else {
+                        assert_eq!(cursor.seek(SeekFrom::End(delta)).unwrap(), expected as u64);
+                        position = expected as u64;
+                    }
+                }
+            }
+            assert_eq!(cursor.position(), position, "position at step {step}");
+        }
+    }
+
+    #[test]
+    fn cursor_and_chain_are_usable_through_the_trait_objects_they_share() {
+        // `Read` is not object-safe (`read_to_end` needs `Self: Sized` only for
+        // the adapters, not for `read`), but the concrete composition has to
+        // typecheck through generic code, which is how programs use it.
+        fn tally<R: Read>(reader: &mut R) -> Result<usize> {
+            let mut count = 0;
+            let mut byte = [0u8; 1];
+            loop {
+                match reader.read(&mut byte)? {
+                    0 => return Ok(count),
+                    n => count += n,
+                }
+            }
+        }
+        let mut chain = Cursor::new(b"abc".to_vec()).chain(Cursor::new(b"de".to_vec()));
+        assert_eq!(tally(&mut chain).unwrap(), 5);
     }
 }

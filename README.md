@@ -31,15 +31,29 @@ What *is* fully real is **Rust the language** plus the `alloc` crate:
   `connect("host:port")`, read/write/close, and `https_get` is one call. The
   program supplies **no clock and no entropy** — the kernel has both. The 0.7.0
   userland implementation (vendored `embedded-tls`) stays behind the
-  off-by-default `vendored-tls` feature.
+  off-by-default `vendored-tls` feature;
+- **userland I/O conveniences** (0.9.0): `io::Cursor` over any
+  `T: AsRef<[u8]>` with `Read`/`BufRead`/`Seek`, `Read::chain`, and a `Tee`
+  writer that mirrors into a second sink. All three are std-shaped, need no
+  syscall, and are covered by the host gate as well as by a live boot.
 
 `pagh_std` does **not** claim to be `std`, does not provide dynamic linking or
 `OsStr`, and returns a typed `io::ErrorKind::Unsupported` for operations the
 ABI cannot express. Those are listed under
 [Limitations vs std](#limitations-vs-std).
 
-**Live evidence:** [`docs/live-sdk-0.8.0.txt`](docs/live-sdk-0.8.0.txt) is the
-QEMU serial transcript for this release — one boot against `pagh-riscv 0.21.0`
+**Live evidence:** [`docs/live-sdk-0.9.0.txt`](docs/live-sdk-0.9.0.txt) is the
+QEMU serial transcript for 0.9.0 — one boot against `pagh-riscv 0.21.0` that
+runs the `io_adapters` matrix, **12/12 checks passed**: `Cursor` reads and
+seeks across buffer boundaries *in the guest*, `Chain` concatenates two
+cursors, the empty cases and a real `File`, and `Tee` mirrors a line into
+`/mnt/io_adapters_tee.txt` and to `stdout` — read back by a *different*
+program (`cat`) and counted exactly once after a second run, so the mirror is
+observed rather than asserted.
+
+The 0.8.0 transcript remains the evidence for that release:
+[`docs/live-sdk-0.8.0.txt`](docs/live-sdk-0.8.0.txt) is the
+QEMU serial transcript — one boot against `pagh-riscv 0.21.0`
 that runs the kernel-backed TLS matrix, **32/32 checks passed**: `tls_get`
 fetches `https://example.com/` with **no clock argument and no seed argument**
 and prints `status 200 body 577 bytes`, while the kernel prints its own
@@ -87,7 +101,9 @@ build.sh                   builds the example ELFs (honours PAGH_API)
 pagh_std/src/
   lib.rs                   crate docs, macros, prelude
   error.rs                 io::Error / ErrorKind / Result
-  io.rs                    Read/Write/Seek/BufRead, buffers, console handles
+  io.rs                    Read/Write/Seek/BufRead, console handles, poll
+  io/pure.rs               the kernel-independent I/O core: traits, buffers,
+                           Cursor, Read::chain, Tee (host-tested)
   fs.rs                    File/OpenOptions/ReadDir/Metadata + fs operations
   env.rs                   args/vars/PWD tracking/temp_dir
   path.rs                  UTF-8 Path/PathBuf/Components, prefix matching, lexical normalize
@@ -116,10 +132,12 @@ pagh_std/src/
   panic.rs                 PanicInfo/abort + the runtime contract
   ffi.rs                   c_* types, CStr/CString
 examples/                  cat, wc, find, threads_mutex, spawn, condvar, io_traits,
-                           tcp_server, udp_echo, sync_primitives, hash_map, dns,
-                           socket_opts, tls_get, tls_get_vendored (feature-gated)
+                           io_adapters, tcp_server, udp_echo, sync_primitives,
+                           hash_map, dns, socket_opts, tls_get,
+                           tls_get_vendored (feature-gated)
 hostcheck/                 host cargo test for the pure modules (path, hash,
-                           collections, lazy, dns_wire, tls url/http/hostname)
+                           collections, lazy, dns_wire, tls url/http/hostname,
+                           io core + error)
 tools/probes/              panic/oom/chdir/fsops/clock diagnostic programs
 tools/live_check.py        builds, boots QEMU, runs the 0.4.0 filesystem matrix
 tools/live_070.py          the 0.7.0 live matrix: hash map, DNS, socket
@@ -127,6 +145,8 @@ tools/live_070.py          the 0.7.0 live matrix: hash map, DNS, socket
 tools/live_080.py          the 0.8.0 live matrix: the kernel-backed TLS
                            client, its two refusals, and the vendored path
                            seeded from getrandom (one boot, one transcript)
+tools/live_090.py          the 0.9.0 live matrix: Cursor/Chain/Tee in one
+                           boot, including the Tee file read back by `cat`
 tools/live_net.py          the 0.6.0 network/sync live matrix (one boot, one
                            command at a time, host peers, docs/ transcript)
 .github/workflows/ci.yml   fmt + RISC-V build + host tests
@@ -136,6 +156,7 @@ docs/live-sdk-0.6.0.txt    the 0.6.0 network/sync captured run (47/47)
 docs/live-sdk-0.7.0.txt    the 0.7.0 captured run (55/55: hash map, DNS,
                            socket options, vendored TLS 1.3)
 docs/live-sdk-0.8.0.txt    the 0.8.0 captured run (32/32: kernel-backed TLS)
+docs/live-sdk-0.9.0.txt    the 0.9.0 captured run (12/12: Cursor, Chain, Tee)
 ```
 
 ## A program
@@ -205,6 +226,7 @@ target/riscv64gc-unknown-none-elf/debug/examples/hash_map                194 KiB
 target/riscv64gc-unknown-none-elf/debug/examples/dns                     301 KiB
 target/riscv64gc-unknown-none-elf/debug/examples/socket_opts             261 KiB
 target/riscv64gc-unknown-none-elf/debug/examples/tls_get                 284 KiB
+target/riscv64gc-unknown-none-elf/debug/examples/io_adapters             225 KiB
 target/riscv64gc-unknown-none-elf/release/examples/tls_get_vendored      760 KiB
 ```
 
@@ -236,18 +258,27 @@ dynamic section.
 
 ### Host tests
 
-The pure path logic can be compiled for the host; `libpagh` itself cannot
+The pure logic can be compiled for the host; `libpagh` itself cannot
 (RISC-V `ecall` assembly). `hostcheck` includes the pure sources directly —
 `path.rs`, `hash.rs`, `collections/{hash_map,hash_set}.rs`, `lazy.rs`,
-`net/dns_wire.rs`, `tls/{url,http}.rs` and the vendored `tls/vendored/hostname.rs`
-— 40 checks:
+`net/dns_wire.rs`, `tls/{url,http}.rs`, the vendored `tls/vendored/hostname.rs`
+and, since 0.9.0, `error.rs` plus the kernel-independent half of the I/O
+module, `io/pure.rs` — 70 checks:
 
 ```sh
 cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu
 ```
 
+Two details are deliberate. `libpagh::errno::Errno` is the only type the
+included sources name from the bare-metal crate, so the gate compiles the
+sibling checkout's own `errno.rs` (its numbers, messages and two round-trip
+tests arrive with it) instead of a copy that can drift. `SeekFrom` is the one
+exception: `libpagh::io` also holds the syscall-backed console handles, so the
+host crate spells out that std-shaped three-variant enum; on the target
+`pagh_std::io::SeekFrom` is `libpagh::io::SeekFrom`.
+
 CI runs that plus `cargo fmt -p pagh_std -p pagh_hostcheck -p pagh_probes --
---check`, `./build.sh --fixtures`, a 1 MiB size check for all fourteen debug
+--check`, `./build.sh --fixtures`, a 1 MiB size check for all fifteen debug
 examples, and `./build.sh --release --vendored` with a size check for
 `tls_get_vendored` (release-only: its debug build is over the limit). (The package-scoped
 form is deliberate: `cargo fmt --all` also formats local path dependencies, and
@@ -390,20 +421,52 @@ python3 tools/live_080.py --skip-build --keep-work
 | `tls_get_vendored … kernel` | the 0.7.0 userland stack still works on the new ABI and takes its seed from `getrandom(278)`; it still needs the caller's clock, which is exactly the difference the two programs make visible |
 | refusals | a self-signed `example.com` on the host (`cause=chain`) and a trusted Google chain pinned under the name `example.com` (`cause=hostname`) are both refused with `EKEYREJECTED`/errno 129, so "the kernel verifies" is not an assertion but a rejection that was observed |
 
+For 0.9.0 the live check is `tools/live_090.py`, one boot for the new
+userland adapters:
+
+```sh
+python3 tools/live_090.py                     # builds, boots, drives, writes docs/
+python3 tools/live_090.py --skip-build --keep-work
+```
+
+| command | what the boot proves |
+|---|---|
+| `run /mnt/io_adapters` | the example's three sections print `Cursor`/`Chain`/`Tee` `ok` and `IO_ADAPTERS PASS` (exit 0): `Cursor` reads and seeks across buffer boundaries in the guest, `Chain` covers two cursors, both empty cases and a real `File`, `Tee` mirrors one line to `stdout` **and** `/mnt/io_adapters_tee.txt` |
+| `run /mnt/io_adapters` again | the file is truncated and rewritten, not appended (checked by the count below) |
+| `run /mnt/cat /mnt/io_adapters_tee.txt` | a *different* program reads the file half; the transcript holds exactly one copy of the mirrored line and `cat` exits 0 |
+
 ## API surface
 
 ### `pagh_std::io`
 
 | Item | Notes |
 |---|---|
-| `Read` | `read`, `read_to_end`, `read_to_string`, `read_exact`, `bytes`, `take`, `by_ref`; implemented for `File`, `TcpStream`, `Stdin`, `BufReader`, `&[u8]`, `&mut R` |
-| `Write` | `write`, `flush`, `write_all`, `write_fmt`, `by_ref`; `File`, `TcpStream`, `Stdout`, `Stderr`, `BufWriter`, `&mut W` |
-| `Seek`, `SeekFrom` | `seek`, `stream_position`, `rewind`, `seek_relative`; regular files |
-| `BufRead`, `BufReader`, `BufWriter` | `fill_buf`, `consume`, `read_until`, `read_line`, `lines`, `split`; 8 KiB default buffer, `with_capacity`, `into_inner`, `get_ref`, `get_mut`; also implemented directly on `File` and `TcpStream` |
+| `Read` | `read`, `read_to_end`, `read_to_string`, `read_exact`, `bytes`, `take`, `chain`, `by_ref`; implemented for `File`, `TcpStream`, `Stdin`, `BufReader`, `Cursor`, `Chain`, `Take`, `&[u8]`, `&mut R` |
+| `Write` | `write`, `flush`, `write_all`, `write_fmt`, `by_ref`; `File`, `TcpStream`, `Stdout`, `Stderr`, `BufWriter`, `Tee`, `&mut W` |
+| `Seek`, `SeekFrom` | `seek`, `stream_position`, `rewind`, `seek_relative`; regular files and `Cursor` |
+| `BufRead`, `BufReader`, `BufWriter` | `fill_buf`, `consume`, `read_until`, `read_line`, `lines`, `split`; 8 KiB default buffer, `with_capacity`, `into_inner`, `get_ref`, `get_mut`; also implemented directly on `File`, `TcpStream`, `Cursor` and `Chain` |
+| `Cursor<T: AsRef<[u8]>>` | in-memory reader: `Read`, `BufRead` and `Seek` (`Start`/`Current`/`End`), `new`, `position`/`set_position`, `get_ref`/`get_mut`, `into_inner`; seeking past the end is allowed (the next read is EOF) and a seek before byte 0 is `InvalidInput`, as in std |
+| `Chain<T, U>` | returned by `Read::chain`; reads `first` to EOF and then `second`, never touching `second` early; `BufRead` when both halves are; `get_ref`/`get_mut`/`into_inner` |
+| `Tee<W, F>` | `Write` adapter that mirrors every byte `writer` accepts into `file` with `write_all`; `new`, `get_ref`/`get_mut`, `into_inner`; `flush` flushes the writer first |
 | `stdin`, `stdout`, `stderr` | console handles; `Stdin::read` blocks by retrying `EAGAIN` with `sched_yield`; output retries `EAGAIN` too |
 | `read_to_end`, `read_to_string`, `copy` | free functions over `Read`/`Write` |
 | `empty`, `repeat`, `sink` | trivial adapters |
 | `Error`, `ErrorKind`, `Result` | `Error` wraps `libpagh::errno::Errno`, keeps the raw number, maps to std-shaped kinds; `Unsupported` is the typed "ABI cannot do this" |
+
+`Cursor`, `Read::chain` and `Tee` are the items 0.8.0's README listed as
+deliberately absent; they are userland-only and need no syscall. Two deviations
+from `std` are spelled out where they live: this `Cursor` has **no `Write`
+implementation** (std has one for `Cursor<&mut [u8]>`/`Cursor<Vec<u8>>`/
+`Cursor<Box<[u8]>>`; here the `T: AsRef<[u8]>` reader is the whole type), and
+`Tee` — which `std` only has on nightly behind `#![feature(io_tee)]` — is
+stable here.
+
+`is_terminal` remains absent, now for a checked reason rather than a policy
+one: the ABI's `fstat` reports the console as `kind = Other`, mode `0o644`,
+which is exactly what it reports for a socket or a pipe, and fds 0-2 are not
+permanently the console either (the kernel's `dup`/`dup2`/`pipe2` can fill a
+closed slot). A truthful `is_terminal` needs a kernel-side signal; the SDK will
+not guess from the fd number.
 
 `BufRead` on `File` and `TcpStream` is a pagh extension (`std` implements it
 for `BufReader`, not for those concrete types). `fill_buf` reads ahead into an
@@ -843,11 +906,13 @@ Impossible without new kernel syscalls (shown with the SDK's typed
 - **`rustc`/`cargo` on the OS**: LLVM + host OS; this SDK is the compile target,
   not an on-device toolchain.
 
-Also deliberately not provided in this first version: `io::Cursor`,
-`Read::chain`, `Tee`, file locking, `is_terminal`, `OsString`, `Rc`/`Arc`
-re-exports, `OnceLock`, and raw-entry/nightly hash-map APIs. They are
-userland-only conveniences the SDK can grow without a kernel change; the
-current surface is the part exercised by the live transcript.
+Also deliberately not provided: file locking, `is_terminal` (see
+[`pagh_std::io`](#pagh_stdio): the ABI cannot distinguish the console from a
+socket, and fd 0-2 are not reserved), `OsString`, `Rc`/`Arc` re-exports,
+`OnceLock`, and raw-entry/nightly hash-map APIs. They are userland-only
+conveniences the SDK can grow without a kernel change, except `is_terminal`,
+which needs the kernel to say what a descriptor is. `io::Cursor`, `Read::chain`
+and `Tee` left this list in 0.9.0 and are part of the surface below.
 
 ## Design notes
 
@@ -867,6 +932,13 @@ current surface is the part exercised by the live transcript.
 - **The ABI is the contract.** Syscall numbers, `Stat`, `Timespec`, `Uname`,
   `Dirent` sizes and flags live in `libpagh`; `pagh_std` uses its wrappers,
   not hand-written `ecall`s.
+- **The host gate compiles what it can of the I/O layer.** `io.rs` and
+  `io/pure.rs` are split along the syscall boundary: the traits, buffers,
+  `Cursor`, `Chain` and `Tee` need only `core` + `alloc`, so the same source
+  file is compiled a second time for `x86_64` and enumerated against every
+  seek/EOF boundary. The only bare-metal type the pure half names is
+  `libpagh::errno::Errno`, whose source the gate compiles from the sibling
+  checkout.
 - **Buffering is userland.** `File` is unbuffered on the `read`/`write` path;
   `BufReader`/`BufWriter` add the explicit 8 KiB layer. `File`/`TcpStream` also
   carry an 8 KiB read-ahead buffer for their direct `BufRead` implementation,
@@ -901,6 +973,7 @@ The transcript covers:
 | DNS | 0.7.0 transcript: `/mnt/etc/resolv.conf` names the DHCP-leased server (the boot log's `dns 10.0.2.3`), a real `A` query with the server's TTLs, `NXDOMAIN`, `InvalidName` before any datagram, a 1 s deadline against a host black hole, and `connect("example.com:80")` → `HTTP/1.1 200 OK` |
 | socket options | 0.7.0 transcript: `SO_TYPE` → `Stream`/`Datagram`, `SO_REUSEADDR` accepted and the second `bind` still refused, non-blocking read `WouldBlock`, 500 ms read deadline and 300 ms UDP deadline enforced by the SDK, `try_clone` echo read back through the clone and the original still usable after it drops |
 | vendored TLS 1.3 | 0.7.0 transcript: a live `https://example.com/` GET through the userland client — chain to the committed bundle (`chain=4 anchors=6`), leaf `sha256:85ca6ab0…`, `CertificateVerify OK`, 577-byte body — and four refusals: `stage=clock`, `stage=entropy`, `cause=chain` (self-signed `openssl s_server`) and `cause=hostname` (a trusted Google chain for `example.com`) |
+| userland I/O adapters | 0.9.0 transcript: `Cursor` read/seek/position/BufRead across buffer boundaries in the guest; `Chain` over two cursors, two empty cases and a `File`+cursor pair; `Tee` mirrored 46 bytes to stdout and `/mnt/io_adapters_tee.txt`, read back by `cat` (exactly one copy after a second run) — `IO_ADAPTERS PASS`, 12/12 checks |
 | kernel-backed TLS | 0.8.0 transcript: `tls_get` fetching `https://example.com/` with **no clock and no seed argument** — `tls: verified leaf=sha256:85ca6ab0… chain=4 certs anchors=6 host=example.com`, `tls: CertificateVerify OK`, `tls: user session 0 open host=example.com (TLS 1.3, AES-128-GCM-SHA256, server authenticated, 110 ms)`, `status 200 body 577 bytes` — the same fetch through `TlsStream` (`--manual`), the vendored program seeded from `getrandom`, and two refusals: `cause=chain` and `cause=hostname`, both errno 129 |
 
 `python3 tools/live_check.py` reproduces the 0.4.0 matrix;
@@ -912,8 +985,11 @@ included). `python3 tools/live_070.py` reproduces the 0.7.0 matrix in one boot
 and rewrites `docs/live-sdk-0.7.0.txt` (**55/55 checks**, kernel and ELF
 hashes included). `python3 tools/live_080.py` reproduces the 0.8.0
 kernel-backed TLS matrix and rewrites `docs/live-sdk-0.8.0.txt` (**32/32
-checks**); the host unit tests are 40 checks
-(`cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`).
+checks**); `python3 tools/live_090.py` reproduces the 0.9.0 I/O-adapter matrix
+and rewrites `docs/live-sdk-0.9.0.txt` (**12/12 checks**). The host unit tests
+are **70 checks** (`cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`):
+the 40 from the earlier pure layers, 28 for the 0.9.0 I/O core, and the two
+`Errno` round-trip tests that arrive with the sibling's `errno.rs` include.
 
 ## CI
 
@@ -925,10 +1001,12 @@ checks**); the host unit tests are 40 checks
    (package-scoped because `--all` would reformat the sibling `pagh-api`);
 4. runs `./build.sh --fixtures` (all examples and probes);
 5. asserts every example a default build produces — including `tcp_server`,
-   `udp_echo`, `sync_primitives` and the kernel-backed `tls_get` — is ≤ 1 MiB;
+   `udp_echo`, `sync_primitives`, `io_adapters` and the kernel-backed
+   `tls_get` — is ≤ 1 MiB;
 6. builds `--release --vendored` and checks `tls_get_vendored` (plus the release
    sizes of the 0.7.0 examples) against the same limit;
-7. runs `cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`;
+7. runs `cargo test -p pagh_hostcheck --target x86_64-unknown-linux-gnu`
+   (the pure I/O core, including `Cursor`/`Chain`/`Tee`, is part of that gate);
 8. uploads the example ELFs.
 
 Neither cargo invocation passes `--locked` (steps 4 and 7): the workspace

@@ -1,6 +1,6 @@
 [package]
 name = "pagh_std"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 publish = false
 description = "A std-like Rust layer over the pagh-riscv native ABI (libpagh)"
@@ -100,6 +100,13 @@ path = "../examples/condvar.rs"
 [[example]]
 name = "io_traits"
 path = "../examples/io_traits.rs"
+
+# 0.9.0: the userland I/O conveniences (`Cursor`, `Read::chain`, `Tee`). It is
+# part of the default build: it links no TLS stack and no extra code, and the
+# live matrix `tools/live_090.py` runs it in one boot.
+[[example]]
+name = "io_adapters"
+path = "../examples/io_adapters.rs"
 
 [[example]]
 name = "tcp_server"
