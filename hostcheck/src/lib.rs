@@ -26,6 +26,10 @@
 //! counters the SDK now re-exports (`rc.rs`, `sync/arc.rs`) are pure too, so
 //! `Arc` is also exercised across real host threads here.
 //!
+//! The 0.11.0 in-memory writer/reader impls live in the same pure half of
+//! `io/pure.rs`, so their exact edges (short writes, `WriteZero`, zero-padding
+//! past a cursor's end, `BufRead for &[u8]`) are pinned by this gate.
+//!
 //! CI runs exactly that. It is not a substitute for the QEMU transcript; it is
 //! the fast loop for component/display/normalization semantics.
 
@@ -1794,5 +1798,255 @@ mod sync_100 {
         assert!(text.is_empty());
         // The initializer runs once, and `force` returns the cached value.
         assert_eq!(LazyLock::force(&text).len(), 0);
+    }
+}
+
+/// The 0.11.0 in-memory writers and readers, driven directly on the host.
+///
+/// `io::Write for Vec<u8>` / `&mut [u8]` / the writer cursors are std's
+/// in-memory sink set; the trait is the SDK's own, so their exact semantics —
+/// short writes, `WriteZero` from `write_all`, zero-padding past a cursor's
+/// end — are pinned here rather than discovered in the guest.
+#[cfg(test)]
+mod io_110 {
+    use super::error::{ErrorKind, Result};
+    use super::io_pure::{copy, BufRead, BufWriter, Cursor, Read, Seek, Tee, Write};
+    use super::libpagh_io::SeekFrom;
+
+    #[test]
+    fn vec_appends_every_byte_and_formats_through_the_trait() {
+        let mut sink = alloc::vec::Vec::new();
+        assert_eq!(sink.write(b"ab").unwrap(), 2);
+        sink.write_all(b"cd").unwrap();
+        assert_eq!(sink, b"abcd");
+        assert_eq!(sink.flush().unwrap(), ());
+
+        // The blanket `Write for &mut W` forwards into the `Vec<u8>` impl.
+        {
+            let mut borrowed = &mut sink;
+            borrowed.write_all(b"ef").unwrap();
+        }
+        assert_eq!(sink, b"abcdef");
+
+        // `write_fmt` is the trait default the SDK's `write!` macro calls.
+        let mut formatted = alloc::vec::Vec::new();
+        formatted
+            .write_fmt(core::format_args!("value = {} and {}", 42, "text"))
+            .unwrap();
+        assert_eq!(formatted, b"value = 42 and text");
+    }
+
+    #[test]
+    fn slice_write_is_short_and_advances_the_slice() {
+        let mut storage = [0u8; 5];
+        {
+            let mut sink: &mut [u8] = &mut storage;
+            assert_eq!(sink.len(), 5);
+            assert_eq!(sink.write(b"abc").unwrap(), 3);
+            assert_eq!(sink.len(), 2);
+            // Only two bytes fit, so this is a short write, not an error.
+            assert_eq!(sink.write(b"def").unwrap(), 2);
+            assert_eq!(sink.len(), 0);
+            // A full destination accepts nothing; `write` reports it as 0.
+            assert_eq!(sink.write(b"z").unwrap(), 0);
+        }
+        assert_eq!(&storage, b"abcde");
+    }
+
+    #[test]
+    fn slice_write_all_reports_write_zero_at_the_end() {
+        let mut storage = [0u8; 3];
+        {
+            let mut sink: &mut [u8] = &mut storage;
+            let error = sink.write_all(b"abcd").unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::WriteZero);
+            assert_eq!(sink.len(), 0);
+        }
+        // The bytes that fit were written before the error, like std.
+        assert_eq!(&storage, b"abc");
+    }
+
+    #[test]
+    fn cursor_vec_writes_at_the_position() {
+        let mut cursor = Cursor::new(alloc::vec::Vec::new());
+        assert_eq!(cursor.write(b"abc").unwrap(), 3);
+        assert_eq!(cursor.position(), 3);
+        assert_eq!(cursor.get_ref().as_slice(), b"abc");
+
+        // Seeking back overwrites in place; the length is unchanged.
+        cursor.seek(SeekFrom::Start(1)).unwrap();
+        assert_eq!(cursor.write(b"XY").unwrap(), 2);
+        assert_eq!(cursor.get_ref().as_slice(), b"aXY");
+        assert_eq!(cursor.position(), 3);
+    }
+
+    #[test]
+    fn cursor_vec_pads_past_the_end_and_grows() {
+        let mut cursor = Cursor::new(b"ab".to_vec());
+        cursor.seek(SeekFrom::Start(5)).unwrap();
+        assert_eq!(cursor.write(b"z").unwrap(), 1);
+        assert_eq!(cursor.position(), 6);
+        assert_eq!(cursor.get_ref().as_slice(), &[b'a', b'b', 0, 0, 0, b'z']);
+
+        // The read side of the same cursor sees the padded bytes.
+        cursor.rewind().unwrap();
+        let mut all = alloc::vec::Vec::new();
+        assert_eq!(cursor.read_to_end(&mut all).unwrap(), 6);
+        assert_eq!(all, [b'a', b'b', 0, 0, 0, b'z']);
+    }
+
+    #[test]
+    fn cursor_borrowed_vec_writer_round_trips() {
+        let mut storage = b"hello".to_vec();
+        {
+            let mut cursor = Cursor::new(&mut storage);
+            cursor.seek(SeekFrom::Start(0)).unwrap();
+            cursor.write_all(b"HE").unwrap();
+            // Appending past the end grows the vector through the borrow.
+            cursor.seek(SeekFrom::End(0)).unwrap();
+            cursor.write_all(b"!").unwrap();
+        }
+        assert_eq!(storage, b"HEllo!");
+    }
+
+    #[test]
+    fn cursor_fixed_slice_writer_is_bounded() {
+        let mut storage = [0u8; 4];
+        {
+            let mut cursor = Cursor::new(&mut storage[..]);
+            assert_eq!(cursor.write(b"abcd").unwrap(), 4);
+            // Past the end: no byte can be written, so the write is short.
+            assert_eq!(cursor.write(b"e").unwrap(), 0);
+            assert_eq!(cursor.position(), 4);
+
+            cursor.seek(SeekFrom::Start(0)).unwrap();
+            assert_eq!(cursor.write(b"XY").unwrap(), 2);
+
+            cursor.seek(SeekFrom::Start(3)).unwrap();
+            let error = cursor.write_all(b"xyz").unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::WriteZero);
+        }
+        // "abcd", then "XY" overwrote the first two bytes, then "x" the last.
+        assert_eq!(&storage, b"XYcx");
+    }
+
+    #[test]
+    fn cursor_array_and_boxed_slice_writers_match_the_slice_one() {
+        // `Cursor<[u8; N]>` (std 1.61) writes into the array it owns.
+        let mut array = Cursor::new([0u8; 3]);
+        assert_eq!(array.write(b"ab").unwrap(), 2);
+        assert_eq!(array.get_ref(), &[b'a', b'b', 0]);
+        assert_eq!(array.write(b"cdef").unwrap(), 1);
+        assert_eq!(array.get_ref(), &[b'a', b'b', b'c']);
+        assert_eq!(
+            array.write_all(b"z").unwrap_err().kind(),
+            ErrorKind::WriteZero
+        );
+
+        // `Cursor<Box<[u8]>>` is the same bounded behaviour, asserting the
+        // `Box` type parameter resolves to the slice impl.
+        let mut boxed = Cursor::new(alloc::vec![0u8; 4].into_boxed_slice());
+        boxed.seek(SeekFrom::Start(1)).unwrap();
+        assert_eq!(boxed.write(b"xy").unwrap(), 2);
+        assert_eq!(boxed.get_ref().as_ref(), &[0, b'x', b'y', 0]);
+        assert_eq!(boxed.position(), 3);
+    }
+
+    #[test]
+    fn slice_bufread_reads_without_copying() {
+        let data = b"line one\nline two";
+        let mut reader: &[u8] = data;
+        assert_eq!(reader.fill_buf().unwrap(), data);
+        reader.consume(5);
+        assert_eq!(reader.fill_buf().unwrap(), &b"one\nline two"[..]);
+
+        let mut line = alloc::vec::Vec::new();
+        assert_eq!(reader.read_until(b'\n', &mut line).unwrap(), 4);
+        assert_eq!(line, b"one\n");
+        assert_eq!(reader.fill_buf().unwrap(), &b"line two"[..]);
+
+        // `lines` over a borrowed slice, and a consume past the end clamps.
+        let mut lines_reader: &[u8] = data;
+        let lines: alloc::vec::Vec<alloc::string::String> = lines_reader
+            .lines()
+            .map(|line| line.expect("fixed input is UTF-8"))
+            .collect();
+        assert_eq!(lines, ["line one", "line two"]);
+
+        let mut exhausted: &[u8] = b"abc";
+        exhausted.consume(100);
+        assert_eq!(exhausted.fill_buf().unwrap(), b"");
+        assert_eq!(exhausted.read(&mut [0u8; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn free_copy_pipes_a_slice_reader_into_a_vec_writer() {
+        let mut source: &[u8] = b"copy through the free function";
+        let mut sink = alloc::vec::Vec::new();
+        assert_eq!(copy(&mut source, &mut sink).unwrap(), 30);
+        assert_eq!(sink, b"copy through the free function");
+        assert_eq!(source, b"");
+    }
+
+    #[test]
+    fn tee_writes_two_vecs_with_no_file_at_all() {
+        // `Tee` now composes with the in-memory sink; no kernel object needed.
+        let mut tee = Tee::new(alloc::vec::Vec::new(), alloc::vec::Vec::new());
+        tee.write_all(b"mirror").unwrap();
+        tee.flush().unwrap();
+        let (writer, file) = tee.into_inner();
+        assert_eq!(writer, b"mirror");
+        assert_eq!(file, b"mirror");
+    }
+
+    #[test]
+    fn bufwriter_over_a_vec_flushes_into_it() {
+        // The capacity must exceed the write, or `BufWriter` bypasses the
+        // buffer on purpose (large writes go straight to the sink).
+        let mut writer = BufWriter::with_capacity(16, alloc::vec::Vec::new());
+        writer.write_all(b"buffered").unwrap();
+        assert_eq!(writer.buffer(), b"buffered");
+        writer.flush().unwrap();
+        assert_eq!(writer.into_inner().expect("flush"), b"buffered");
+    }
+
+    #[test]
+    fn cursor_vec_write_then_read_back_through_bufread() {
+        let mut cursor = Cursor::new(alloc::vec::Vec::new());
+        cursor.write_all(b"alpha\nbeta\n").unwrap();
+        cursor.rewind().unwrap();
+
+        let mut lines = alloc::vec::Vec::new();
+        loop {
+            let mut line = alloc::string::String::new();
+            if cursor.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            lines.push(line);
+        }
+        assert_eq!(lines, ["alpha\n", "beta\n"]);
+        let mut rest = alloc::vec::Vec::new();
+        assert_eq!(cursor.read_to_end(&mut rest).unwrap(), 0);
+    }
+
+    #[test]
+    fn every_in_memory_sink_is_a_result_typed_writer() {
+        // Compile-time inventory: each std in-memory writer implements this
+        // SDK's `Write`, and the reader-cursor types still implement `Read`.
+        fn assert_write<W: Write>() {}
+        fn assert_read<R: Read>() {}
+        fn assert_bufread<B: BufRead>() {}
+        assert_write::<alloc::vec::Vec<u8>>();
+        assert_write::<&mut [u8]>();
+        assert_write::<Cursor<alloc::vec::Vec<u8>>>();
+        assert_write::<Cursor<&mut alloc::vec::Vec<u8>>>();
+        assert_write::<Cursor<&mut [u8]>>();
+        assert_write::<Cursor<[u8; 4]>>();
+        assert_write::<Cursor<alloc::boxed::Box<[u8]>>>();
+        assert_write::<Tee<alloc::vec::Vec<u8>, alloc::vec::Vec<u8>>>();
+        assert_read::<Cursor<alloc::vec::Vec<u8>>>();
+        assert_bufread::<Cursor<alloc::vec::Vec<u8>>>();
+        assert_bufread::<&[u8]>();
+        fn _takes_result(_: Result<usize>) {}
     }
 }
