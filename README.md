@@ -235,10 +235,26 @@ runtime are linked.
 
 ## Branching and releases
 
-`main` is the stable branch; `dev` is the experimental integration branch. Feature
-and fix PRs target `dev`; stable releases are tagged from `main`, release
-candidates/pre-releases from `dev` (`vX.Y.Z-rc.N`). The release workflow refuses a
-tag cut from the wrong branch. See [BRANCHING.md](BRANCHING.md).
+`main` is the stable branch; `dev` is the experimental integration branch.
+Feature and fix PRs target `dev`, and CI (the `fmt, build, host tests` job) must
+be green before merge.
+
+Releases are tag-driven and new tags always carry the `v` prefix:
+
+- `vX.Y.Z` is cut from `main` and published as a full GitHub release with the
+  source archive (`pagh-rust-vX.Y.Z.tar.gz`) and its `.sha256`;
+- `vX.Y.Z-rc.N` is cut from `dev`, must not already be on `main`, and is
+  published as a GitHub pre-release. Release candidates are the only
+  pre-release channel — there is no `-pre.N` lane.
+
+The workflow refuses a tag whose branch ancestry or base version does not match
+`pagh_std/Cargo.toml`. **Hotfixes** (`hotfix/*` from `main`, straight to a
+stable PATCH tag with no RC, then a `--no-ff` merge back into `dev`) are limited
+to critical/high verified security findings or a release-blocking regression in
+a released version; everything else rides `dev`.
+
+The operational checklist is [RELEASING.md](RELEASING.md); the branch model,
+tag conventions and release flow are in [BRANCHING.md](BRANCHING.md).
 
 ## Build
 
