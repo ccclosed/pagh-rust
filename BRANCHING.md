@@ -35,16 +35,17 @@ maintainer actions.
 
 | Tag | Cut from | GitHub release type |
 |---|---|---|
-| `vX.Y.Z` (or bare `X.Y.Z`, the historical style here) | `main` | Release |
+| `vX.Y.Z` (bare `X.Y.Z` is history only; new bare tags are refused) | `main` | Release |
 | `vX.Y.Z-rc.N` | `dev` (must not already be on `main`) | Pre-release |
 
-New tags always carry the `v` prefix (`vX.Y.Z`, `vX.Y.Z-rc.N`); old bare-numeric
-tags stay as history. The version source of truth is `pagh_std/Cargo.toml`
-(`[package].version`; the workspace root manifest is virtual and has no
-version); `dev` carries the next release version, `main` the last released one.
-The release workflow checks both the tag's branch (stable: main; RC: dev-only)
-and that the tag base equals the version source. The operational checklist is in
-`RELEASING.md`.
+New tags always carry the `v` prefix and must match `vX.Y.Z` or
+`vX.Y.Z-rc.N` exactly; old bare-numeric tags remain as history but are refused
+by the release workflow if pushed again. The version source of truth is
+`pagh_std/Cargo.toml` (`[package].version`; the workspace root manifest is
+virtual and has no version); `dev` carries the next release version, `main` the
+last released one. The release workflow checks both the tag's branch (stable:
+main; RC: dev-only) and that the tag base equals the version source. The
+operational checklist is in `RELEASING.md`.
 
 ## Why two branches
 
