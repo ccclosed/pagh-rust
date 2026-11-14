@@ -12,8 +12,10 @@ name: release
 # publishes a source archive (plus `.sha256`); it builds no binary artifact
 # here — the examples are built and size-checked in `ci.yml`.
 #
-# Old bare-numeric tags remain valid history (the workflow still accepts them on
-# push); only newly created tags must use the `v` prefix.
+# Old bare-numeric tags remain as history only: newly created tags must use the
+# `v` prefix, and the workflow rejects bare-numeric (and any other non-`v`) tags
+# on push. The `[0-9]*` trigger stays so such a push fails loudly instead of
+# silently doing nothing.
 
 on:
   push:
@@ -46,26 +48,20 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           base="${tag#v}"
           base="${base%%-*}"
-          case "$tag" in
-            v[0-9]*.[0-9]*.[0-9]*) : ;;
-            *) echo "::error::new tags must be vX.Y.Z or vX.Y.Z-rc.N (got $tag)"; exit 1 ;;
-          esac
-          case "$tag" in
-            *-rc.[0-9]*)
-              git merge-base --is-ancestor "$GITHUB_SHA" origin/dev || {
-                echo "::error::pre-release $tag must be reachable from dev"; exit 1; }
-              if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-                echo "::error::pre-release $tag must not point at a commit already on main"; exit 1
-              fi
-              ;;
-            *-*)
-              echo "::error::only the -rc.N suffix is supported for pre-releases (got $tag)"; exit 1
-              ;;
-            *)
-              git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
-                echo "::error::stable release $tag must be reachable from main"; exit 1; }
-              ;;
-          esac
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "::error::new tags must be vX.Y.Z or vX.Y.Z-rc.N (got $tag)"
+            exit 1
+          fi
+          if [[ "$tag" =~ -rc\.[0-9]+$ ]]; then
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/dev || {
+              echo "::error::pre-release $tag must be reachable from dev"; exit 1; }
+            if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::pre-release $tag must not point at a commit already on main"; exit 1
+            fi
+          else
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+              echo "::error::stable release $tag must be reachable from main"; exit 1; }
+          fi
           if [ -f "$VERSION_FILE" ]; then
             version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$VERSION_FILE" | head -n1)"
           elif [ -f VERSION ]; then
